@@ -9,7 +9,7 @@ import tempfile
 import urllib.request
 
 
-ARM64E_URL = "https://build.frida.re/deps/{version}/sdk-ios-arm64e.tar.xz"
+ARM64E_URL = "https://build.yszint.local/deps/{version}/sdk-ios-arm64e.tar.xz"
 
 
 class CommandError(Exception):

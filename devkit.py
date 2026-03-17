@@ -338,7 +338,7 @@ class CompilerApplication:
  *
  * %(cc)s %(cflags)s %(source_filename)s -o %(program_filename)s -L. -l%(library_name)s %(ldflags)s
  *
- * Visit https://frida.re to learn more about Frida.
+ * Visit https://github.com/crmcl/yszint to learn more about Frida.
  */""" % params
 
             return preamble + "\n\n" + example_code

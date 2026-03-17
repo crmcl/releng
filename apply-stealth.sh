@@ -1,0 +1,625 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# apply-stealth.sh — Transform stock Frida into a stealth-renamed fork.
+#
+# Usage:
+#   ./releng/apply-stealth.sh                              # Use default conf, cwd as target
+#   ./releng/apply-stealth.sh /path/to/custom.conf         # Custom conf, cwd as target
+#   ./releng/apply-stealth.sh /path/to/custom.conf /path   # Custom conf, explicit target
+#
+# This script is IDEMPOTENT — running it twice produces the same result.
+# It transforms a clean upstream Frida checkout into the configured namespace.
+#
+# The script does NOT modify:
+#   - Subproject directory names (frida-core/, frida-gum/, etc.)
+#   - Library output filenames (libfrida-core-1.0.a, etc.)
+#   - Python import name (import frida)
+#   - Upstream dependency URLs (github.com/frida/glib, etc.)
+#   - .wrap files (Meson subproject references)
+#   - Test files
+#   - Build output directories
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONF_FILE="${1:-$SCRIPT_DIR/stealth.conf}"
+REPO_ROOT="${2:-$(pwd)}"
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
+
+if [[ ! -f "$CONF_FILE" ]]; then
+    echo "ERROR: Config file not found: $CONF_FILE"
+    echo "Usage: $0 [config_file] [target_dir]"
+    echo "  config_file defaults to releng/stealth.conf next to the script"
+    echo "  target_dir  defaults to current working directory"
+    exit 1
+fi
+
+# shellcheck source=stealth.conf
+source "$CONF_FILE"
+
+# ─── Derived values ─────────────────────────────────────────────────────────
+UP="frida"
+UP_P="Frida"
+UP_U="FRIDA"
+UP_PORT="27042"
+UP_RDNS="re.frida"
+UP_SELINUX="frida_file"
+UP_V8="-frida"
+UP_AUTHOR="Frida Developers"
+UP_EMAIL="oleavr@frida.re"
+UP_URL="https://frida.re"
+
+ST="$STEALTH_NAME"
+ST_P="$STEALTH_NAME_PASCAL"
+ST_U="$STEALTH_NAME_UPPER"
+
+log() { echo "[stealth] $*"; }
+
+# ─── Exclude filter for find ────────────────────────────────────────────────
+# Prune patterns to skip node_modules, __pycache__, build, deps, .git, test dirs
+PRUNE_ARGS=( -path '*/node_modules' -o -path '*/__pycache__' -o -path '*/build' -o -path '*/deps' -o -path '*/.git' -o -path '*.wrap' )
+
+# Helper: run sed on matching files within a directory
+# Usage: sed_in <dir> <name_pattern> <sed_args...>
+#   name_pattern: e.g. "*.vala" or "*.c *.h *.vala *.vapi"
+sed_in() {
+    local dir="$1"; shift
+    local names="$1"; shift
+
+    # Build -name arguments
+    local name_arr=()
+    local first=true
+    for n in $names; do
+        if $first; then
+            name_arr+=( -name "$n" )
+            first=false
+        else
+            name_arr+=( -o -name "$n" )
+        fi
+    done
+
+    find "$dir" \( "${PRUNE_ARGS[@]}" \) -prune -o -type f \( "${name_arr[@]}" \) -print0 2>/dev/null | \
+        xargs -0 -r sed -i "$@"
+}
+
+# Helper: run sed on specific file if it exists
+sed_file() {
+    local f="$REPO_ROOT/$1"; shift
+    [[ -f "$f" ]] || return 0
+    sed -i "$@" "$f"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 1: Vala/C Namespace Renames
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 1: Vala/C namespace renames"
+
+# 1a. Vala namespace and qualified references
+sed_in "$REPO_ROOT/subprojects" "*.vala" \
+    -e "s/namespace ${UP_P}\b/namespace ${ST_P}/g" \
+    -e "s/${UP_P}\.\([A-Z]\)/${ST_P}.\1/g"
+[[ -d "$REPO_ROOT/src" ]] && sed_in "$REPO_ROOT/src" "*.vala" \
+    -e "s/namespace ${UP_P}\b/namespace ${ST_P}/g" \
+    -e "s/${UP_P}\.\([A-Z]\)/${ST_P}.\1/g"
+log "  Vala namespace declarations + qualified refs"
+
+# 1b. GIR namespace attributes
+sed_in "$REPO_ROOT/subprojects" "*.vala" \
+    -e "s/gir_namespace = \"${UP_P}\"/gir_namespace = \"${ST_P}\"/g" \
+    -e "s/lower_case_cprefix = \"${UP}_\"/lower_case_cprefix = \"${ST}_\"/g"
+log "  GIR namespace attributes"
+
+# 1c. C/Vala prefixes: FRIDA_ → YSZINT_, frida_ → yszint_, FridaX → YszintX
+# Combine all 3 patterns into one sed call per file for speed
+sed_in "$REPO_ROOT/subprojects" "*.c *.h *.vala *.vapi" \
+    -e "s/${UP_U}_/${ST_U}_/g" \
+    -e "s/\b${UP}_/${ST}_/g" \
+    -e "s/${UP_P}\([A-Z][a-zA-Z]*\)/${ST_P}\1/g"
+log "  C/Vala function and type prefixes"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 2: Protocol & Network Identifiers
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 2: Protocol & network identifiers"
+
+# 2a. Default port (Vala + Python examples)
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
+    -e "s/${UP_PORT}/${STEALTH_PORT}/g"
+sed_in "$REPO_ROOT/subprojects/frida-python" "*.py" \
+    -e "s/port=${UP_PORT}/port=${STEALTH_PORT}/g" \
+    -e "s/port=${UP_PORT},/port=${STEALTH_PORT},/g"
+log "  Port: ${UP_PORT} → ${STEALTH_PORT}"
+
+# 2b. User-Agent / Server headers (Vala + C)
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
+    -e "s/\"${UP_P}\//\"${ST_P}\//g" \
+    -e "s/\"Server: ${UP_P}\//\"Server: ${ST_P}\//g"
+# Inspector server in C (gumjs)
+sed_in "$REPO_ROOT/subprojects/frida-gum" "*.c" \
+    -e "s/\"${UP_P}\/v/\"${ST_P}\/v/g"
+log "  User-Agent / Server headers"
+
+# 2c. D-Bus service names and bundle IDs
+# Cover all file types that reference re.frida.* identifiers
+for dir in subprojects/frida-core subprojects/frida-gum subprojects/frida-python subprojects/frida-tools; do
+    [[ -d "$REPO_ROOT/$dir" ]] || continue
+    sed_in "$REPO_ROOT/$dir" "*.vala *.xml *.h *.c *.py *.ts *.sh *.plist meson.build" \
+        -e "s/${UP_RDNS}\./${STEALTH_RDNS}./g" \
+        -e "s|/${UP_RDNS//./\/}/|/${STEALTH_RDNS//./\/}/|g"
+done
+# Also cover releng modules
+sed_in "$REPO_ROOT/releng" "*.json *.js" \
+    -e "s/${UP_RDNS}\./${STEALTH_RDNS}./g"
+log "  D-Bus: ${UP_RDNS}.* → ${STEALTH_RDNS}.*"
+
+# 2d. Protocol message prefixes (frida:rpc, frida:stdout, frida:stderr)
+for dir in subprojects/frida-core subprojects/frida-gum subprojects/frida-python; do
+    [[ -d "$REPO_ROOT/$dir" ]] || continue
+    sed_in "$REPO_ROOT/$dir" "*.vala *.js *.py *.c *.ts" \
+        -e "s/\"${UP}:rpc\"/\"${ST}:rpc\"/g" \
+        -e "s/'${UP}:rpc'/'${ST}:rpc'/g" \
+        -e "s/\"${UP}:stdout\"/\"${ST}:stdout\"/g" \
+        -e "s/\"${UP}:stderr\"/\"${ST}:stderr\"/g"
+done
+log "  Protocol prefixes: ${UP}:* → ${ST}:*"
+
+# 2e. SELinux file contexts
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala *.c" \
+    -e "s/${UP_SELINUX}/${STEALTH_SELINUX_TYPE}/g"
+log "  SELinux type: ${UP_SELINUX} → ${STEALTH_SELINUX_TYPE}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 3: Build System
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 3: Build system"
+
+# 3a. Root meson.build project name
+sed_file "meson.build" \
+    -e "s/project('${UP}'/project('${ST}'/g" \
+    -e "s/'${UP}_version'/'${ST}_version'/g" \
+    -e "s/${UP}_version\.py/${ST}_version.py/g" \
+    -e "s/'${UP}_tools'/'${ST}_tools'/g" \
+    -e "s/'${UP}_python'/'${ST}_python'/g" \
+    -e "s/'${UP}_node'/'${ST}_node'/g" \
+    -e "s/'${UP}_clr'/'${ST}_clr'/g" \
+    -e "s/'${UP}_swift'/'${ST}_swift'/g" \
+    -e "s/'${UP}_qml'/'${ST}_qml'/g"
+log "  Root meson.build"
+
+# 3b. Meson options
+sed_file "meson.options" \
+    -e "s/${UP}_tools/${ST}_tools/g" \
+    -e "s/${UP}_python/${ST}_python/g" \
+    -e "s/${UP}_node/${ST}_node/g" \
+    -e "s/${UP}_clr/${ST}_clr/g" \
+    -e "s/${UP}_swift/${ST}_swift/g" \
+    -e "s/${UP}_qml/${ST}_qml/g" \
+    -e "s/${UP}-server/${ST}-server/g" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/${UP}-inject/${ST}-inject/g"
+log "  Meson options"
+
+# 3c. G_LOG_DOMAIN in subproject meson.build files
+sed_in "$REPO_ROOT/subprojects" "meson.build" \
+    -e "s/G_LOG_DOMAIN=\"${UP_P}\"/G_LOG_DOMAIN=\"${ST_P}\"/g"
+log "  G_LOG_DOMAIN"
+
+# 3d. File prefix maps (debug info obfuscation)
+for mapping in "${STEALTH_PREFIX_MAPS[@]}"; do
+    original="${mapping%%=*}"
+    replacement="${mapping##*=}"
+    sed_in "$REPO_ROOT/subprojects" "meson.build" \
+        -e "s|${original}=${original}|${original}=${replacement}|g"
+done
+log "  File prefix maps"
+
+# 3e. Binary target names in meson.build
+sed_in "$REPO_ROOT/subprojects/frida-core" "meson.build" \
+    -e "s/'${UP}-server/'${ST}-server/g" \
+    -e "s/'${UP}-agent/'${ST}-agent/g" \
+    -e "s/'${UP}-gadget/'${ST}-gadget/g" \
+    -e "s/'${UP}-helper/'${ST}-helper/g" \
+    -e "s/'${UP}-inject/'${ST}-inject/g" \
+    -e "s/\"${UP}-server/\"${ST}-server/g" \
+    -e "s/\"${UP}-agent/\"${ST}-agent/g" \
+    -e "s/\"${UP}-gadget/\"${ST}-gadget/g" \
+    -e "s/\"${UP}-helper/\"${ST}-helper/g"
+log "  Binary target names"
+
+# 3f. Agent entrypoint symbol (including meson.build linker export flags)
+sed_in "$REPO_ROOT/subprojects" "*.vala *.c *.h meson.build" \
+    -e "s/${UP}_agent_main/${ST}_agent_main/g"
+log "  Agent entrypoint symbol"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 4: Thread Names
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 4: Thread names"
+
+sed_in "$REPO_ROOT/subprojects" "*.vala *.c" \
+    -e "s/\"${UP}-server-main-loop\"/\"${ST}-server-main-loop\"/g" \
+    -e "s/\"${UP}-android-helper\"/\"${ST}-android-helper\"/g" \
+    -e "s/\"${UP}-main-loop\"/\"${ST}-main-loop\"/g" \
+    -e "s/\"${UP}-logcat\"/\"${ST}-logcat\"/g"
+log "  Thread name patterns"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 5: JavaScript Runtime (GumJS)
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 5: JavaScript runtime"
+
+if [[ -d "$REPO_ROOT/subprojects/frida-gum/bindings/gumjs/runtime" ]]; then
+    sed_in "$REPO_ROOT/subprojects/frida-gum/bindings/gumjs/runtime" "*.js" \
+        -e "s/'${UP}:rpc'/'${ST}:rpc'/g" \
+        -e "s/\"${UP}:rpc\"/\"${ST}:rpc\"/g"
+    log "  GumJS runtime RPC protocol"
+fi
+
+# Java bridge log prefix
+if [[ -d "$REPO_ROOT/subprojects/frida-java-bridge" ]]; then
+    sed_in "$REPO_ROOT/subprojects/frida-java-bridge" "*.js" \
+        -e "s/\[${UP}-java-bridge\]/[${ST}-java-bridge]/g"
+    log "  Java bridge log prefix"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 6: Python Bindings
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 6: Python bindings"
+
+for setup_file in \
+    "subprojects/frida-python/setup.py" \
+    "subprojects/frida-python/setup.cfg" \
+    "subprojects/frida-python/pyproject.toml"; do
+    sed_file "$setup_file" \
+        -e "s/name=\"${UP}\"/name=\"${ST}\"/g" \
+        -e "s/name='${UP}'/name='${ST}'/g" \
+        -e "s/${UP_AUTHOR}/${STEALTH_AUTHOR}/g" \
+        -e "s/${UP_EMAIL}/${STEALTH_EMAIL}/g" \
+        -e "s|${UP_URL}|${STEALTH_URL}|g" \
+        -e "s/\"${UP}\"/\"${ST}\"/g"
+done
+log "  Python setup files"
+
+# Python C extension macros
+EXT_C="$REPO_ROOT/subprojects/frida-python/frida/_frida/extension.c"
+if [[ -f "$EXT_C" ]]; then
+    sed -i "s/PY${UP_U}_/PY${ST_U}_/g" "$EXT_C"
+    log "  Python C extension macros"
+fi
+
+# Python RPC protocol
+sed_in "$REPO_ROOT/subprojects/frida-python" "*.py" \
+    -e "s/\"${UP}:rpc\"/\"${ST}:rpc\"/g" \
+    -e "s/'${UP}:rpc'/'${ST}:rpc'/g"
+log "  Python RPC protocol"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 7: CLI Tools
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 7: CLI tools"
+
+sed_file "subprojects/frida-tools/setup.py" \
+    -e "s/name=\"${UP}-tools\"/name=\"${ST}-tools\"/g" \
+    -e "s/name='${UP}-tools'/name='${ST}-tools'/g" \
+    -e "s/${UP_AUTHOR}/${STEALTH_AUTHOR}/g" \
+    -e "s/${UP_EMAIL}/${STEALTH_EMAIL}/g" \
+    -e "s|${UP_URL}|${STEALTH_URL}|g" \
+    -e "s/${UP_P} CLI/${ST_P} CLI/g" \
+    -e "s/\[${UP_P}\]/[${ST_P}]/g" \
+    -e "s/\"${UP} = /\"${ST} = /g" \
+    -e "s/\"${UP}-/\"${ST}-/g"
+
+# Tool description strings
+if [[ -d "$REPO_ROOT/subprojects/frida-tools/frida_tools" ]]; then
+    sed_in "$REPO_ROOT/subprojects/frida-tools/frida_tools" "*.py" \
+        -e "s/${UP_P}'s/${ST_P}'s/g"
+fi
+log "  CLI tools setup + descriptions"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 8: deps.toml
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 8: deps.toml"
+
+DEPS_TOML="$REPO_ROOT/releng/deps.toml"
+if [[ -f "$DEPS_TOML" ]]; then
+    sed -i \
+        -e "s|embedder_string=${UP_V8}|embedder_string=${STEALTH_V8_EMBEDDER}|g" \
+        -e "s|embedder_string=-${UP}|embedder_string=${STEALTH_V8_EMBEDDER}|g" \
+        "$DEPS_TOML"
+    log "  V8 embedder: ${UP_V8} → ${STEALTH_V8_EMBEDDER}"
+
+    for pair in "${STEALTH_FORK_URLS[@]}"; do
+        orig="${pair%%|*}"
+        repl="${pair##*|}"
+        sed -i "s|${orig}|${repl}|g" "$DEPS_TOML"
+        log "  Fork URL: ${orig} → ${repl}"
+    done
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 9: Version Scripts
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 9: Version scripts"
+
+ROOT_VERSION_SRC="$REPO_ROOT/releng/${UP}_version.py"
+ROOT_VERSION_DST="$REPO_ROOT/releng/${ST}_version.py"
+if [[ -f "$ROOT_VERSION_SRC" && ! -f "$ROOT_VERSION_DST" ]]; then
+    cp "$ROOT_VERSION_SRC" "$ROOT_VERSION_DST"
+    sed -i "s/${UP_P}Version/${ST_P}Version/g" "$ROOT_VERSION_DST"
+    echo "# Stub — see ${ST}_version.py" > "$ROOT_VERSION_SRC"
+    log "  Root: ${UP}_version.py → ${ST}_version.py"
+elif [[ -f "$ROOT_VERSION_DST" ]]; then
+    sed -i "s/${UP_P}Version/${ST_P}Version/g" "$ROOT_VERSION_DST"
+fi
+
+for subdir in subprojects/frida-core subprojects/frida-gum subprojects/frida-python \
+              subprojects/frida-tools subprojects/frida-node subprojects/frida-swift \
+              subprojects/frida-qml subprojects/frida-clr; do
+    sub_src="$REPO_ROOT/$subdir/releng/${UP}_version.py"
+    sub_dst="$REPO_ROOT/$subdir/releng/${ST}_version.py"
+
+    if [[ -f "$sub_src" && ! -f "$sub_dst" ]]; then
+        cp "$sub_src" "$sub_dst"
+        sed -i "s/${UP_P}Version/${ST_P}Version/g" "$sub_dst"
+        echo "# Stub — see ${ST}_version.py" > "$sub_src"
+    elif [[ -f "$sub_dst" ]]; then
+        sed -i "s/${UP_P}Version/${ST_P}Version/g" "$sub_dst"
+    fi
+
+    # Update meson.build references
+    sub_meson="$REPO_ROOT/$subdir/meson.build"
+    [[ -f "$sub_meson" ]] && sed -i "s/${UP}_version\.py/${ST}_version.py/g" "$sub_meson"
+done
+log "  Subproject version scripts"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 10: macOS plist
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 10: Platform-specific"
+
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.plist" \
+    -e "s/<string>${UP_P}<\/string>/<string>${ST_P}<\/string>/g" \
+    -e "s/${UP_RDNS}\./${STEALTH_RDNS}./g"
+log "  macOS plist files"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 11: Android Helper
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 11: Android helper"
+
+if [[ -d "$REPO_ROOT/subprojects/frida-core/src/android-helper" ]]; then
+    sed_in "$REPO_ROOT/subprojects/frida-core/src/android-helper" "*.java" \
+        -e "s/package ${UP_RDNS}\./package ${STEALTH_RDNS}./g"
+    log "  Android helper Java packages"
+fi
+
+# Helper DEX path references
+sed_in "$REPO_ROOT/subprojects/frida-core/src" "*.vala" \
+    -e "s/${UP}-helper-/${ST}-helper-/g" \
+    -e "s/\"${UP}-helper/\"${ST}-helper/g"
+log "  Helper DEX references"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 12: VAPI files
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 12: VAPI files"
+
+sed_in "$REPO_ROOT/subprojects" "*.vapi" \
+    -e "s/namespace ${UP_P}/namespace ${ST_P}/g" \
+    -e "s/${UP_P}\.\([A-Z]\)/${ST_P}.\1/g" \
+    -e "s/cprefix = \"${UP_P}/cprefix = \"${ST_P}/g" \
+    -e "s/lower_case_cprefix = \"${UP}_/lower_case_cprefix = \"${ST}_/g" \
+    -e "s/cheader_filename = \"${UP}-/cheader_filename = \"${ST}-/g"
+log "  VAPI namespace and CCode attributes"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 13: Node.js bindings
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 13: Node.js bindings"
+
+for node_file in \
+    "subprojects/frida-node/package.json" \
+    "subprojects/frida-node/src/addon.cc" \
+    "subprojects/frida-node/src/device.cc" \
+    "subprojects/frida-node/src/signals.cc"; do
+    sed_file "$node_file" \
+        -e "s/\"${UP}\"/\"${ST}\"/g" \
+        -e "s/${UP_P}\([A-Z]\)/${ST_P}\1/g" \
+        -e "s/${UP}_/${ST}_/g"
+done
+log "  Node.js binding identity"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 14: Releng scripts
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 14: Releng build scripts"
+
+sed_in "$REPO_ROOT/releng" "*.py" \
+    -e "s/${UP}_version/${ST}_version/g" \
+    -e "s/${UP_P}Version/${ST_P}Version/g" \
+    -e "s|https://build.frida.re|https://build.${ST}.local|g" \
+    -e "s|https://frida.re|${STEALTH_URL}|g"
+log "  Root releng scripts"
+
+for subdir in subprojects/frida-core subprojects/frida-gum subprojects/frida-python \
+              subprojects/frida-tools subprojects/frida-node; do
+    [[ -d "$REPO_ROOT/$subdir/releng" ]] || continue
+    sed_in "$REPO_ROOT/$subdir/releng" "*.py" \
+        -e "s/${UP}_version/${ST}_version/g" \
+        -e "s/${UP_P}Version/${ST_P}Version/g"
+done
+log "  Subproject releng scripts"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASS 15: Catch-all string literals
+# ═══════════════════════════════════════════════════════════════════════════════
+log "Pass 15: Catch-all"
+
+# Temp agent filename pattern
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
+    -e "s/\.${UP}-agent/.${ST}-agent/g"
+log "  Temp agent filename pattern"
+
+# ── 15b. String-literal error messages containing frida-server/gadget/helper ──
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
+    -e "s/${UP}-server/${ST}-server/g" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/${UP}-helper/${ST}-helper/g"
+log "  Error message string literals"
+
+# ── 15c. C #include headers referencing frida-helper-*.h ──
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.c *.h" \
+    -e "s/\"${UP}-helper/\"${ST}-helper/g" \
+    -e "s/#include \"${UP}-/#include \"${ST}-/g"
+log "  C include headers"
+
+# ── 15d. Python codegen writing namespace Frida ──
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.py" \
+    -e "s/namespace ${UP_P}/namespace ${ST_P}/g" \
+    -e "s/${UP_P}\([A-Z]\)/${ST_P}\1/g" \
+    -e "s/${UP}-helper/${ST}-helper/g" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/${UP}-server/${ST}-server/g"
+log "  Python codegen/embed scripts"
+
+# ── 15e. Java helper content (re/frida/ path + string refs) ──
+if [[ -d "$REPO_ROOT/subprojects/frida-core/src/android-helper" ]]; then
+    sed_in "$REPO_ROOT/subprojects/frida-core/src/android-helper" "*.java" \
+        -e "s/${UP}-helper/${ST}-helper/g" \
+        -e "s|/${UP}-helper|/${ST}-helper|g"
+    log "  Java helper content strings"
+fi
+
+# ── 15f. Releng module JS (gadget download URLs etc.) ──
+sed_in "$REPO_ROOT/releng" "*.js" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s|/frida/frida/|/${ST}/${ST}/|g"
+log "  Releng JS modules"
+
+# ── 15g. Fruity injector gadget references ──
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
+    -e "s/${UP}-gadget/${ST}-gadget/g"
+log "  Fruity injector gadget refs"
+
+# ── 15h. Shell scripts in frida-core tools/ and tests/ ──
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.sh" \
+    -e "s/${UP}-server/${ST}-server/g" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/${UP}-helper/${ST}-helper/g"
+log "  Shell scripts (tools, tests)"
+
+# ── 15i. Gadget / test shell scripts in frida-gum ──
+sed_in "$REPO_ROOT/subprojects/frida-gum" "*.sh" \
+    -e "s/${UP}-gadget/${ST}-gadget/g"
+log "  Gum test shell scripts"
+
+# ── 15j. Gadget thread name in C and meson options descriptions ──
+sed_in "$REPO_ROOT/subprojects/frida-core/lib/gadget" "*.c meson.build" \
+    -e "s/${UP}-gadget/${ST}-gadget/g"
+sed_file "subprojects/frida-core/meson.options" \
+    -e "s/${UP}-server/${ST}-server/g" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/${UP}-helper/${ST}-helper/g"
+log "  Gadget glue/meson thread names and descriptions"
+
+# ── 15k. frida-tools application.py and repl.py ──
+if [[ -d "$REPO_ROOT/subprojects/frida-tools" ]]; then
+    sed_in "$REPO_ROOT/subprojects/frida-tools" "*.py" \
+        -e "s/${UP}-server/${ST}-server/g" \
+        -e "s/${UP}-gadget/${ST}-gadget/g" \
+        -e "s/${UP}\\.re/${ST}.re/g"
+    log "  frida-tools Python refs"
+fi
+
+# ── 15l. Python example TS files (D-Bus paths) ──
+find "$REPO_ROOT/subprojects/frida-python" -name '*.ts' -print0 2>/dev/null | \
+    xargs -0 -r sed -i \
+    -e "s|/${UP}/|/${ST}/|g" \
+    -e "s/${UP}\\.re/${ST}.re/g"
+log "  Python example TS files"
+
+# ── 15m. Releng module package.json files ──
+sed_in "$REPO_ROOT/releng/modules" "*.json" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/${UP}-server/${ST}-server/g"
+log "  Releng module package.json"
+
+# ── 15n. GitHub CI scripts ──
+if [[ -d "$REPO_ROOT/.github/scripts" ]]; then
+    sed_in "$REPO_ROOT/.github/scripts" "*.sh" \
+        -e "s/${UP}-server/${ST}-server/g" \
+        -e "s/${UP}-gadget/${ST}-gadget/g"
+    log "  GitHub CI scripts"
+fi
+
+# ── 15o. Xcode entitlements (.xcent) and Objective-C (.m) ──
+sed_in "$REPO_ROOT/subprojects" "*.xcent *.m" \
+    -e "s/${UP_RDNS}\./${STEALTH_RDNS}./g" \
+    -e "s/${UP}-helper/${ST}-helper/g" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/\"${UP}-gadget/\"${ST}-gadget/g"
+log "  Xcode entitlements and Objective-C"
+
+# ── 15p. Linker symbol export files (.def, .symbols, .version) ──
+find "$REPO_ROOT/subprojects" \( "${PRUNE_ARGS[@]}" \) -prune -o \
+    -type f \( -name '*.def' -o -name '*.symbols' -o -name '*.version' \) \
+    -print0 2>/dev/null | xargs -0 -r sed -i \
+    -e "s/${UP}_agent_main/${ST}_agent_main/g"
+log "  Linker symbol export files"
+
+# ── 15q. Test Makefiles and helper Makefiles ──
+find "$REPO_ROOT/subprojects" \( "${PRUNE_ARGS[@]}" \) -prune -o \
+    -type f -name 'Makefile*' -print0 2>/dev/null | xargs -0 -r sed -i \
+    -e "s/${UP}_agent_main/${ST}_agent_main/g" \
+    -e "s/${UP}-helper/${ST}-helper/g" \
+    -e "s/${UP}-helpers/${ST}-helpers/g" \
+    -e "s/${UP_RDNS}\./${STEALTH_RDNS}./g" \
+    -e "s|/${UP}/|/${ST}/|g"
+log "  Makefiles"
+
+# ── 15r. CI workflow files (.yml) ──
+for dir in "$REPO_ROOT" "$REPO_ROOT/subprojects/frida-core"; do
+    [[ -d "$dir/.github" ]] || continue
+    sed_in "$dir/.github" "*.yml" \
+        -e "s/${UP}-server/${ST}-server/g" \
+        -e "s/${UP}-gadget/${ST}-gadget/g" \
+        -e "s/${UP}-helper/${ST}-helper/g"
+done
+[[ -f "$REPO_ROOT/.cirrus.yml" ]] && sed -i \
+    -e "s/${UP}-server/${ST}-server/g" \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/${UP}-helper/${ST}-helper/g" "$REPO_ROOT/.cirrus.yml"
+log "  CI workflow files"
+
+# ── 15s. .gitignore ──
+[[ -f "$REPO_ROOT/.gitignore" ]] && sed -i \
+    -e "s/${UP}-gadget/${ST}-gadget/g" \
+    -e "s/${UP}-server/${ST}-server/g" "$REPO_ROOT/.gitignore"
+log "  .gitignore"
+
+# ── 15t. Fish completions ──
+sed_in "$REPO_ROOT/subprojects/frida-tools" "*.fish" \
+    -e "s/${UP}-server/${ST}-server/g" \
+    -e "s/${UP}-gadget/${ST}-gadget/g"
+log "  Shell completions"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DONE
+# ═══════════════════════════════════════════════════════════════════════════════
+log ""
+log "══════════════════════════════════════════════════════════"
+log "  Stealth transform complete."
+log "  Config: $CONF_FILE"
+log "  Namespace: ${UP_P} → ${ST_P}"
+log "  Port: ${UP_PORT} → ${STEALTH_PORT}"
+log "  Protocol: ${UP}:* → ${ST}:*"
+log "  D-Bus: ${UP_RDNS}.* → ${STEALTH_RDNS}.*"
+log "══════════════════════════════════════════════════════════"
+log ""
+log "Next steps:"
+log "  1. Run stealth-reviewer to verify no leaks"
+log "  2. Apply Android 16 patches (dlopen temp-file, zymbiote disable)"
+log "  3. Build: ./configure --host=android-arm64 && make"

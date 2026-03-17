@@ -1116,7 +1116,7 @@ class CommandError(Exception):
 
 DEPS_TOML_PATH = RELENG_DIR / "deps.toml"
 
-BUNDLE_URL = "https://build.frida.re/deps/{version}/{filename}"
+BUNDLE_URL = "https://build.yszint.local/deps/{version}/{filename}"
 
 
 class Bundle(Enum):

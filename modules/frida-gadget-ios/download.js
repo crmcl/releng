@@ -29,7 +29,7 @@ async function alreadyDownloaded() {
 }
 
 async function download() {
-  const response = await httpsGet(`https://github.com/frida/frida/releases/download/${gadget.version}/frida-gadget-${gadget.version}-ios-universal.dylib.gz`);
+  const response = await httpsGet(`https://github.com/yszint/yszint/releases/download/${gadget.version}/yszint-gadget-${gadget.version}-ios-universal.dylib.gz`);
 
   const tempGadgetPath = gadget.path + '.download';
   const tempGadgetStream = fs.createWriteStream(tempGadgetPath);
@@ -42,7 +42,7 @@ async function pruneOldVersions() {
   const gadgetDir = path.dirname(gadget.path);
   const currentName = path.basename(gadget.path);
   for (const name of await readdir(gadgetDir)) {
-    if (name.startsWith('frida-gadget-') && name.endsWith('-ios-universal.dylib') && name !== currentName) {
+    if (name.startsWith('yszint-gadget-') && name.endsWith('-ios-universal.dylib') && name !== currentName) {
       await unlink(path.join(gadgetDir, name));
     }
   }
