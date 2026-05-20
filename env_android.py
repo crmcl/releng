@@ -76,6 +76,7 @@ def init_machine_config(machine: MachineSpec,
     linker_flags = [
         "-Wl,-z,relro",
         "-Wl,-z,noexecstack",
+        "-Wl,-z,max-page-size=4096",
         "-Wl,--gc-sections",
     ]
 
