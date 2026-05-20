@@ -606,6 +606,154 @@ sed_in "$REPO_ROOT/subprojects/frida-tools" "*.fish" \
     -e "s/${UP}-gadget/${ST}-gadget/g"
 log "  Shell completions"
 
+# ====================================================================
+# PASS 16: Extended coverage (added 2026-05-20)
+#
+# Catches 7 categories the March 17 (17.6.x → 17.8.2) rebase had to fix
+# manually after the script ran. Cross-referenced against actual leaks
+# observed on a fresh 17.9.10 upstream checkout. Each sub-pass targets
+# one specific class of leak — see per-pass comments.
+# ====================================================================
+log "Pass 16: Extended coverage (rebase-derived fixes)"
+
+# -- 16a. Vala 'Frida.lowercase_identifier' qualified calls --
+# Pass 1a catches 'Frida.PascalCase' but not 'Frida.helper_path',
+# 'Frida.get_main_context()', 'Frida.agent_path', 'Frida.compiler_backend_path'
+# (8 leaks across host-session.vala / helper-process.vala / compiler.vala
+# on fresh 17.9.10).
+sed_in "$REPO_ROOT/subprojects" "*.vala" \
+    -e "s/\\b${UP_P}\\.\\([a-z]\\)/${ST_P}.\\1/g"
+log "  Vala 'Frida.lowercase_func()' qualified calls"
+
+# -- 16b. FRIDA_* macros in meson.build (config.h symbol generators) --
+# Pass 1c does FRIDA_ -> YSZINT_ in *.c *.h *.vala *.vapi but NOT meson.build.
+# Result: cdata.set_quoted('FRIDA_VERSION', ...) survives. Once a .c file is
+# renamed via pass 1c, the build fails with 'use of undeclared identifier
+# YSZINT_VERSION' because config.h was generated with FRIDA_VERSION.
+#
+# Also catches HAVE_FRIDA_GLIB (the build define indicating yszint's glib
+# fork is in use). Per user-memory '0-yszint-setup.md' Bug 3, this rename
+# is required for SIGSEGV avoidance in frida-gum.
+sed_in "$REPO_ROOT/subprojects" "meson.build" \
+    -e "s/'${UP_U}_/'${ST_U}_/g" \
+    -e "s/\"${UP_U}_/\"${ST_U}_/g" \
+    -e "s/HAVE_${UP_U}_GLIB/HAVE_${ST_U}_GLIB/g" \
+    -e "s/-DHAVE_${UP_U}_GLIB/-DHAVE_${ST_U}_GLIB/g"
+# Also rename the define in source files that test for it
+sed_in "$REPO_ROOT/subprojects" "*.c *.h *.vala" \
+    -e "s/HAVE_${UP_U}_GLIB/HAVE_${ST_U}_GLIB/g"
+log "  FRIDA_* macros in meson.build (config.h symbols, HAVE_FRIDA_GLIB)"
+
+# -- 16c. #include "frida-*.h" in Objective-C (.m) files --
+# Pass 15c covers .c and .h but not .m. darwin-*-glue.m, gadget-darwin.m,
+# device-monitor-darwin.m all #include "frida-core.h" / "frida-base.h" /
+# "frida-tvos.h" and stay broken.
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.m" \
+    -e "s/#include \"${UP}-/#include \"${ST}-/g" \
+    -e "s/#include <${UP}-/#include <${ST}-/g"
+log "  ObjC #include paths"
+
+# -- 16d. Assembly symbol names ('.S' / '.s' files) --
+# Linker errors observed in March session: '_frida_set_errno',
+# '_frida_on_syscall_error' in src/linux/helpers/*.S (capital-S = preprocessed).
+find "$REPO_ROOT/subprojects" \( "${PRUNE_ARGS[@]}" \) -prune -o \
+    -type f \( -name '*.S' -o -name '*.s' \) \
+    -print0 2>/dev/null | xargs -0 -r sed -i \
+    -e "s/_${UP}_/_${ST}_/g"
+log "  Assembly '.S/.s' symbol names"
+
+# -- 16e. Python embed/modulate scripts (libc-shim / agent ctors) --
+# api/generate.py, lib/agent/modulate.py emit C code with literal symbol
+# names: frida_libc_shim_init/_deinit, frida_on_load/_unload. Pass 15d
+# catches 'namespace Frida' and 'FridaX' patterns but not these snake_case
+# strings inside Python string literals.
+sed_in "$REPO_ROOT/subprojects/frida-core" "*.py" \
+    -e "s/${UP}_libc_shim_init/${ST}_libc_shim_init/g" \
+    -e "s/${UP}_libc_shim_deinit/${ST}_libc_shim_deinit/g" \
+    -e "s/${UP}_on_load/${ST}_on_load/g" \
+    -e "s/${UP}_on_unload/${ST}_on_unload/g" \
+    -e "s/${UP}_agent_main/${ST}_agent_main/g"
+log "  Python embed/modulate scripts (libc-shim, ctor names)"
+
+# -- 16f. api/generate.py public-API codegen --
+# api/generate.py writes frida-core.gir / frida-core.h / frida-core.vapi etc.
+# Inside its string literals it emits 'Frida...', 'frida_...', 'FRIDA_TYPE_...'
+# for public API types. Pass 1c is C-only; this targets the Python that
+# GENERATES the C.
+GEN_PY="$REPO_ROOT/subprojects/frida-core/src/api/generate.py"
+if [[ -f "$GEN_PY" ]]; then
+    sed -i \
+        -e "s/'${UP_P}/'${ST_P}/g" \
+        -e "s/\"${UP_P}/\"${ST_P}/g" \
+        -e "s/'${UP}_/'${ST}_/g" \
+        -e "s/\"${UP}_/\"${ST}_/g" \
+        -e "s/'${UP_U}_/'${ST_U}_/g" \
+        -e "s/\"${UP_U}_/\"${ST_U}_/g" \
+        "$GEN_PY"
+    log "  api/generate.py codegen string literals"
+fi
+
+# -- 16g. G_DECLARE_FINAL_TYPE third argument (module prefix) --
+# In G_DECLARE_FINAL_TYPE (FooBar, foo_bar, MODULE_PREFIX, TYPE, Parent),
+# arg 3 is the macro-emission prefix. The script catches leading-attached
+# patterns like 'FRIDA_TYPE_' (in 1c) but not the standalone 'FRIDA' in
+# this macro position. Example: frida-python/extension.c line 157,
+# frida-core lib/pipe/pipe-glue.h.
+sed_in "$REPO_ROOT/subprojects" "*.c *.h" \
+    -e "s/G_DECLARE_FINAL_TYPE (\\([^,]*\\), \\([^,]*\\), ${UP_U},/G_DECLARE_FINAL_TYPE (\\1, \\2, ${ST_U},/g" \
+    -e "s/G_DECLARE_DERIVABLE_TYPE (\\([^,]*\\), \\([^,]*\\), ${UP_U},/G_DECLARE_DERIVABLE_TYPE (\\1, \\2, ${ST_U},/g"
+log "  G_DECLARE_FINAL_TYPE module-prefix arg"
+
+# -- 16h. Rename frida-* source files on disk to yszint-* --
+# Pass 3 / pass 15 rename meson.build *references* to 'yszint-helper-types.vala'
+# but leave the actual file named 'frida-helper-types.vala' on disk -- build
+# fails 'File frida-helper-types.vala does not exist'.
+#
+# We chose Option A: rename the source files to match the script's intent.
+# Source filenames don't reach the runtime detection surface; only their
+# build-system refs matter, and those were already renamed.
+#
+# Scope (yes-rename): src/, lib/, server/, inject/, portal/  -- runtime sources
+# Scope (no-rename): devkit/, releng/, tests/, third-party    -- shipped
+#                                                                examples
+for sp_dir in subprojects/frida-core subprojects/frida-gum; do
+    [[ -d "$REPO_ROOT/$sp_dir" ]] || continue
+    for area in src lib server inject portal; do
+        area_path="$REPO_ROOT/$sp_dir/$area"
+        [[ -d "$area_path" ]] || continue
+        find "$area_path" \( "${PRUNE_ARGS[@]}" \) -prune -o \
+            -type f -name "${UP}-*" -print0 2>/dev/null | \
+            while IFS= read -r -d '' f; do
+                # Get just the basename component, replace prefix
+                dir=$(dirname "$f")
+                base=$(basename "$f")
+                new_base="${ST}-${base#${UP}-}"
+                new="$dir/$new_base"
+                if [[ "$f" != "$new" && ! -e "$new" ]]; then
+                    mv "$f" "$new" 2>/dev/null || true
+                fi
+            done
+    done
+done
+log "  File rename: frida-* -> yszint-* (src/lib/server/inject/portal)"
+
+# -- 16i. frida-glue.c (file rename + meson reference) --
+# Special case: src/frida-glue.c is at the top of src/, doesn't fit under
+# the inner directories pattern above. Rename it and any meson.build refs.
+for sp_dir in subprojects/frida-core; do
+    glue_old="$REPO_ROOT/$sp_dir/src/${UP}-glue.c"
+    glue_new="$REPO_ROOT/$sp_dir/src/${ST}-glue.c"
+    if [[ -f "$glue_old" && ! -e "$glue_new" ]]; then
+        mv "$glue_old" "$glue_new"
+    fi
+    # Update meson.build refs (the existing script's pass 15c handles
+    # the #include side; this handles the source-list side)
+    if [[ -f "$REPO_ROOT/$sp_dir/src/meson.build" ]]; then
+        sed -i "s|'${UP}-glue\\.c'|'${ST}-glue.c'|g" "$REPO_ROOT/$sp_dir/src/meson.build"
+    fi
+done
+log "  Top-level src/frida-glue.c rename"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DONE
 # ═══════════════════════════════════════════════════════════════════════════════
