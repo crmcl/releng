@@ -100,10 +100,17 @@ def detect(repo: Path) -> YszintVersion:
 
     nano = distance
 
+    # Try strict semver first; if that fails, try to FIND a semver substring
+    # inside the tag (handles WIP tags like 'rebase-17.9.10-wip-20260520'
+    # which contain 17.9.10 but aren't bare semver). This keeps the build
+    # working when a workspace is on a non-release tag (e.g. mid-rebase).
     m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$", tag_part)
     if m is None:
-        raise VersionParseError(
-            f"Tag does not match expected semver pattern: {tag_part!r}")
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)(?:-([^-]+))?", tag_part)
+        if m is None:
+            # Final fallback: don't break the build, but emit 0.0.0 so the
+            # caller knows this isn't a release build.
+            return YszintVersion("0.0.0", 0, 0, 0, nano, commit)
 
     major = int(m.group(1))
     minor = int(m.group(2))

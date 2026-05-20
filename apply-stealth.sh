@@ -79,6 +79,7 @@ sed_in() {
         fi
     done
 
+    [[ -d "$dir" ]] || return 0
     find "$dir" \( "${PRUNE_ARGS[@]}" \) -prune -o -type f \( "${name_arr[@]}" \) -print0 2>/dev/null | \
         xargs -0 -r sed -i "$@"
 }
@@ -88,6 +89,14 @@ sed_file() {
     local f="$REPO_ROOT/$1"; shift
     [[ -f "$f" ]] || return 0
     sed -i "$@" "$f"
+}
+
+# Helper: run sed_in only if the directory exists. Use this for releng/
+# and other top-level dirs that may be absent in partial-tree test runs.
+sed_in_optional() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
+    sed_in "$@"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -124,19 +133,19 @@ log "  C/Vala function and type prefixes"
 log "Pass 2: Protocol & network identifiers"
 
 # 2a. Default port (Vala + Python examples)
-sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
+[[ -d "$REPO_ROOT/subprojects/frida-core" ]] && sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
     -e "s/${UP_PORT}/${STEALTH_PORT}/g"
-sed_in "$REPO_ROOT/subprojects/frida-python" "*.py" \
+[[ -d "$REPO_ROOT/subprojects/frida-python" ]] && sed_in "$REPO_ROOT/subprojects/frida-python" "*.py" \
     -e "s/port=${UP_PORT}/port=${STEALTH_PORT}/g" \
     -e "s/port=${UP_PORT},/port=${STEALTH_PORT},/g"
 log "  Port: ${UP_PORT} → ${STEALTH_PORT}"
 
 # 2b. User-Agent / Server headers (Vala + C)
-sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
+[[ -d "$REPO_ROOT/subprojects/frida-core" ]] && sed_in "$REPO_ROOT/subprojects/frida-core" "*.vala" \
     -e "s/\"${UP_P}\//\"${ST_P}\//g" \
     -e "s/\"Server: ${UP_P}\//\"Server: ${ST_P}\//g"
 # Inspector server in C (gumjs)
-sed_in "$REPO_ROOT/subprojects/frida-gum" "*.c" \
+[[ -d "$REPO_ROOT/subprojects/frida-gum" ]] && sed_in "$REPO_ROOT/subprojects/frida-gum" "*.c" \
     -e "s/\"${UP_P}\/v/\"${ST_P}\/v/g"
 log "  User-Agent / Server headers"
 
@@ -148,9 +157,13 @@ for dir in subprojects/frida-core subprojects/frida-gum subprojects/frida-python
         -e "s/${UP_RDNS}\./${STEALTH_RDNS}./g" \
         -e "s|/${UP_RDNS//./\/}/|/${STEALTH_RDNS//./\/}/|g"
 done
-# Also cover releng modules
-sed_in "$REPO_ROOT/releng" "*.json *.js" \
-    -e "s/${UP_RDNS}\./${STEALTH_RDNS}./g"
+# Also cover releng modules (guarded — releng/ may not exist in detached test runs)
+if [[ -d "$REPO_ROOT/releng" ]]; then
+    sed_in "$REPO_ROOT/releng" "*.json *.js" \
+        -e "s/${UP_RDNS}\./${STEALTH_RDNS}./g"
+else
+    log "  (skip: releng/ not present at target root — partial tree)"
+fi
 log "  D-Bus: ${UP_RDNS}.* → ${STEALTH_RDNS}.*"
 
 # 2d. Protocol message prefixes (frida:rpc, frida:stdout, frida:stderr)
@@ -437,7 +450,7 @@ log "  Node.js binding identity"
 # ═══════════════════════════════════════════════════════════════════════════════
 log "Pass 14: Releng build scripts"
 
-sed_in "$REPO_ROOT/releng" "*.py" \
+sed_in_optional "$REPO_ROOT/releng" "*.py" \
     -e "s/${UP}_version/${ST}_version/g" \
     -e "s/${UP_P}Version/${ST_P}Version/g" \
     -e "s|https://build.frida.re|https://build.${ST}.local|g" \
@@ -494,7 +507,7 @@ if [[ -d "$REPO_ROOT/subprojects/frida-core/src/android-helper" ]]; then
 fi
 
 # ── 15f. Releng module JS (gadget download URLs etc.) ──
-sed_in "$REPO_ROOT/releng" "*.js" \
+sed_in_optional "$REPO_ROOT/releng" "*.js" \
     -e "s/${UP}-gadget/${ST}-gadget/g" \
     -e "s|/frida/frida/|/${ST}/${ST}/|g"
 log "  Releng JS modules"
@@ -542,7 +555,7 @@ find "$REPO_ROOT/subprojects/frida-python" -name '*.ts' -print0 2>/dev/null | \
 log "  Python example TS files"
 
 # ── 15m. Releng module package.json files ──
-sed_in "$REPO_ROOT/releng/modules" "*.json" \
+sed_in_optional "$REPO_ROOT/releng/modules" "*.json" \
     -e "s/${UP}-gadget/${ST}-gadget/g" \
     -e "s/${UP}-server/${ST}-server/g"
 log "  Releng module package.json"
@@ -753,6 +766,62 @@ for sp_dir in subprojects/frida-core; do
     fi
 done
 log "  Top-level src/frida-glue.c rename"
+
+# ====================================================================
+# PASS 17: Post-Pass-16 gap closures (added 2026-05-20 mid-rebase)
+#
+# Three new leak categories discovered while completing the 17.8.2 →
+# 17.9.10 rebase. Each surfaced AFTER Pass 16's coverage was complete.
+# See docs/REBASE_17.9.10_EXECUTION_LOG.md gap list 9-11.
+# ====================================================================
+log "Pass 17: Post-rebase gap closures"
+
+# -- 17a. #include "frida-*.h" string-literal include paths in C/C++ --
+# Pass 1c rewrites IDENTIFIERS in *.c *.h *.vala *.vapi, but the regex
+# 'Frida\([A-Z][a-zA-Z]*\)' doesn't match lowercase 'frida-' nor does
+# the 'FRIDA_' regex. String-literal #include paths like
+#   #include "frida-selinux.h"
+#   #include "frida-base.h"
+# survive. Found in subprojects/frida-core/server/server-glue.c and
+# subprojects/frida-core/inject/inject-glue.c on fresh 17.9.10.
+sed_in "$REPO_ROOT/subprojects" "*.c *.h *.cpp *.cc *.hpp" \
+    -e "s|\"${UP}-|\"${ST}-|g" \
+    -e "s|<${UP}-|<${ST}-|g"
+log "  C/C++ #include \"${UP}-*\" → \"${ST}-*\""
+
+# -- 17b. GIR / typelib filename literals in meson.build --
+# Pass 16b rewrites FRIDA_* macros and 'FRIDA_*'/"FRIDA_*" quoted forms,
+# but doesn't catch CamelCase-with-version-suffix like:
+#   core_gir_name = f'Frida-@api_version@.gir'
+#   output: f'Frida-@api_version@.typelib'
+#   base_gir_name = f'FridaBase-@api_version@.gir'
+# These appear in subprojects/frida-core/{src,src/api,lib/base}/meson.build.
+sed_in "$REPO_ROOT/subprojects" "meson.build" \
+    -e "s|'${UP_P}-|'${ST_P}-|g" \
+    -e "s|\"${UP_P}-|\"${ST_P}-|g" \
+    -e "s|f'${UP_P}-|f'${ST_P}-|g" \
+    -e "s|'${UP_P}Base-|'${ST_P}Base-|g" \
+    -e "s|f'${UP_P}Base-|f'${ST_P}Base-|g"
+log "  meson.build '${UP_P}-*.gir|.typelib' filename literals"
+
+# -- 17c. 'from releng.frida_version import ...' Python imports --
+# Pass 6 rewrites Python IDENTIFIERS but not module-import string paths.
+# subprojects/frida-{core,gum}/tools/detect-version.py contain:
+#   from releng.frida_version import detect
+# When meson invokes them with MESON_SOURCE_ROOT set, the script tries
+# to import releng.frida_version which doesn't exist (we shipped
+# releng/yszint_version.py via stealth.conf STEALTH_SPECIAL_FILES).
+# Result: ModuleNotFoundError → meson setup exits 1 cryptically.
+for sp in subprojects/frida-core subprojects/frida-gum subprojects/frida-python subprojects/frida-tools; do
+    [[ -d "$REPO_ROOT/$sp" ]] || continue
+    sed_in "$REPO_ROOT/$sp" "*.py" \
+        -e "s|from releng\.${UP}_version|from releng.${ST}_version|g" \
+        -e "s|import releng\.${UP}_version|import releng.${ST}_version|g" \
+        -e "s|releng/${UP}_version|releng/${ST}_version|g" \
+        -e "s|\"${UP}_version\.py\"|\"${ST}_version.py\"|g" \
+        -e "s|'${UP}_version\.py'|'${ST}_version.py'|g"
+done
+log "  Python 'from releng.${UP}_version import ...' imports"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DONE
