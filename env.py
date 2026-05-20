@@ -220,6 +220,15 @@ def generate_machine_config(machine: MachineSpec,
 
         pkg_config_libdir = str(sdk_prefix / machine.libdatadir / "pkgconfig")
 
+        if pkg_config is None:
+            pkg_config_binary = shutil.which("pkg-config")
+            if pkg_config_binary is not None:
+                pkg_config = [str(pkg_config_binary)]
+                if default_library == "static":
+                    pkg_config += ["--static"]
+                pkg_config += [f"--define-variable=frida_sdk_prefix={sdk_prefix}"]
+                binaries["pkg-config"] = strv_to_meson(pkg_config)
+
         sdk_bindir = sdk_prefix / "bin" / build_machine.os_dash_arch
         if sdk_bindir.exists():
             for f in sdk_bindir.iterdir():
