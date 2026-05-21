@@ -63,13 +63,24 @@ PRUNE_ARGS=( -path '*/node_modules' -o -path '*/__pycache__' -o -path '*/build' 
 # Helper: run sed on matching files within a directory
 # Usage: sed_in <dir> <name_pattern> <sed_args...>
 #   name_pattern: e.g. "*.vala" or "*.c *.h *.vala *.vapi"
+#
+# IMPORTANT: This function MUST disable shell globbing while iterating
+# $names. If the caller's CWD (or anywhere on the shell-glob expansion
+# path) contains a file matching one of the patterns (e.g. test_attach.py
+# matching *.py), bash will replace the wildcard with that filename BEFORE
+# the find sees it. Result: silent under-coverage (find skips the actual
+# matching files and only looks for the literal filename). This was the
+# root cause of Bug #8: the Python binding's frida:rpc/yszint:rpc rewrite
+# was skipped because *.py expanded to test_attach.py.
 sed_in() {
     local dir="$1"; shift
     local names="$1"; shift
 
-    # Build -name arguments
+    # Build -name arguments. Disable filename globbing for this loop:
+    # `set -f` prevents `*.py` etc. from being expanded by bash.
     local name_arr=()
     local first=true
+    set -f
     for n in $names; do
         if $first; then
             name_arr+=( -name "$n" )
@@ -78,6 +89,7 @@ sed_in() {
             name_arr+=( -o -name "$n" )
         fi
     done
+    set +f
 
     [[ -d "$dir" ]] || return 0
     find "$dir" \( "${PRUNE_ARGS[@]}" \) -prune -o -type f \( "${name_arr[@]}" \) -print0 2>/dev/null | \
@@ -167,13 +179,18 @@ fi
 log "  D-Bus: ${UP_RDNS}.* → ${STEALTH_RDNS}.*"
 
 # 2d. Protocol message prefixes (frida:rpc, frida:stdout, frida:stderr)
+# Cover ALL surrounding-character variants. The bare s/frida:rpc/yszint:rpc/g
+# catches escaped-quote forms (`\"frida:rpc\"` in Vala source for rpc.vala
+# line 73's `json.index_of ("\\\"frida:rpc\\\"")` substring check). The
+# explicit quoted variants are kept for self-documenting intent.
+# Safe to do bare: `frida:rpc` is a protocol-identifier-only string that
+# should never appear in any context other than these literals.
 for dir in subprojects/frida-core subprojects/frida-gum subprojects/frida-python; do
     [[ -d "$REPO_ROOT/$dir" ]] || continue
     sed_in "$REPO_ROOT/$dir" "*.vala *.js *.py *.c *.ts" \
-        -e "s/\"${UP}:rpc\"/\"${ST}:rpc\"/g" \
-        -e "s/'${UP}:rpc'/'${ST}:rpc'/g" \
-        -e "s/\"${UP}:stdout\"/\"${ST}:stdout\"/g" \
-        -e "s/\"${UP}:stderr\"/\"${ST}:stderr\"/g"
+        -e "s/${UP}:rpc/${ST}:rpc/g" \
+        -e "s/${UP}:stdout/${ST}:stdout/g" \
+        -e "s/${UP}:stderr/${ST}:stderr/g"
 done
 log "  Protocol prefixes: ${UP}:* → ${ST}:*"
 
@@ -669,11 +686,16 @@ log "  ObjC #include paths"
 # -- 16d. Assembly symbol names ('.S' / '.s' files) --
 # Linker errors observed in March session: '_frida_set_errno',
 # '_frida_on_syscall_error' in src/linux/helpers/*.S (capital-S = preprocessed).
+# Also catches non-underscore-prefixed macros like `frida_asm_align`,
+# `FRIDA_MAX_ERRNO` referenced from same-directory .h headers which DO
+# get rewritten by Pass 1c (since .h is in Pass 1c's scope).
 find "$REPO_ROOT/subprojects" \( "${PRUNE_ARGS[@]}" \) -prune -o \
     -type f \( -name '*.S' -o -name '*.s' \) \
     -print0 2>/dev/null | xargs -0 -r sed -i \
-    -e "s/_${UP}_/_${ST}_/g"
-log "  Assembly '.S/.s' symbol names"
+    -e "s/_${UP}_/_${ST}_/g" \
+    -e "s/\\b${UP}_/${ST}_/g" \
+    -e "s/${UP_U}_/${ST_U}_/g"
+log "  Assembly '.S/.s' symbol names (incl. asm macros, MAX_ERRNO)"
 
 # -- 16e. Python embed/modulate scripts (libc-shim / agent ctors) --
 # api/generate.py, lib/agent/modulate.py emit C code with literal symbol
@@ -695,16 +717,47 @@ log "  Python embed/modulate scripts (libc-shim, ctor names)"
 # GENERATES the C.
 GEN_PY="$REPO_ROOT/subprojects/frida-core/src/api/generate.py"
 if [[ -f "$GEN_PY" ]]; then
+    # generate.py emits C source via f-strings: writing FRIDA_TYPE_X,
+    # frida_unref, frida_get_X. The previously-targeted quote-prefixed
+    # patterns don't catch identifiers in the middle of f-strings.
+    # Solution: rewrite ALL FRIDA_ / frida_ / Frida{} occurrences in
+    # this single file. (Comments inside generate.py should be stealth
+    # anyway; nothing in this file should retain frida_ identifiers.)
+    #
+    # Also catches Python %-format and {} templates: Frida%(name)s and
+    # Frida{name} — generate.py emits PascalCase type names this way.
     sed -i \
-        -e "s/'${UP_P}/'${ST_P}/g" \
-        -e "s/\"${UP_P}/\"${ST_P}/g" \
-        -e "s/'${UP}_/'${ST}_/g" \
-        -e "s/\"${UP}_/\"${ST}_/g" \
-        -e "s/'${UP_U}_/'${ST_U}_/g" \
-        -e "s/\"${UP_U}_/\"${ST_U}_/g" \
+        -e "s/${UP_U}_/${ST_U}_/g" \
+        -e "s/\\b${UP}_/${ST}_/g" \
+        -e "s/${UP_P}\([A-Z][a-zA-Z]*\)/${ST_P}\1/g" \
+        -e "s/${UP_P}%/${ST_P}%/g" \
+        -e "s/${UP_P}{/${ST_P}{/g" \
+        -e "s/'${UP}-/'${ST}-/g" \
+        -e "s/\"${UP}-/\"${ST}-/g" \
+        -e "s/f\"${UP}-/f\"${ST}-/g" \
+        -e "s/f'${UP}-/f'${ST}-/g" \
         "$GEN_PY"
     log "  api/generate.py codegen string literals"
 fi
+
+# -- 16f_post. embed-helper.py / embed-agent.py output-basename + asset filenames --
+# embed-helper.py / embed-agent.py construct file paths whose basenames
+# become the resource-compiler symbol names. Need both:
+#  - --output-basename frida-data-X       → yszint-data-X
+#    (drives the .vapi/.h/.c output names)
+#  - frida-agent-{arch}.so / frida-helper-{arch}
+#    (drives the embedded-asset filenames → resource-compiler getter
+#     names like get_frida_agent_arm64_so_blob)
+for embed_py in "$REPO_ROOT/subprojects/frida-core/src/embed-helper.py" \
+                "$REPO_ROOT/subprojects/frida-core/src/embed-agent.py"; do
+    [[ -f "$embed_py" ]] || continue
+    sed -i \
+        -e "s|${UP}-data-|${ST}-data-|g" \
+        -e "s|${UP}-agent|${ST}-agent|g" \
+        -e "s|${UP}-helper|${ST}-helper|g" \
+        "$embed_py"
+done
+log "  embed-helper.py / embed-agent.py basename + asset filenames"
 
 # -- 16g. G_DECLARE_FINAL_TYPE third argument (module prefix) --
 # In G_DECLARE_FINAL_TYPE (FooBar, foo_bar, MODULE_PREFIX, TYPE, Parent),
@@ -822,6 +875,145 @@ for sp in subprojects/frida-core subprojects/frida-gum subprojects/frida-python 
         -e "s|'${UP}_version\.py'|'${ST}_version.py'|g"
 done
 log "  Python 'from releng.${UP}_version import ...' imports"
+
+# -- 17d. meson.build file-refs in lib/*/meson.build --
+# Pass 16h renames source files on disk (frida-selinux.h → yszint-selinux.h)
+# but doesn't update meson.build's `files('frida-X')` / `static_library`
+# / `vala_header` / `vala_vapi` quoted-string references.
+#
+# IMPORTANT: only quoted-string forms 'frida-*' / "frida-*" / f'frida-*'.
+# We deliberately do NOT touch `frida_X` Meson identifiers here — those
+# would need a coordinated rename in the root meson.build (which defines
+# variables like `frida_component_cflags`, `frida_version`, etc. that the
+# whole project consumes). That's a separate Pass 18-candidate.
+#
+# Scope is limited to subprojects/frida-core/lib/*/ to avoid touching
+# pkg-config dependency names like `dependency('frida-gum-1.0')` at the
+# top level.
+for sp in subprojects/frida-core; do
+    [[ -d "$REPO_ROOT/$sp/lib" ]] || continue
+    find "$REPO_ROOT/$sp/lib" -name meson.build -print0 2>/dev/null | \
+        xargs -0 -r sed -i \
+            -e "s|'${UP}-|'${ST}-|g" \
+            -e "s|\"${UP}-|\"${ST}-|g" \
+            -e "s|f'${UP}-|f'${ST}-|g" \
+            -e "s|=${UP}-|=${ST}-|g"
+done
+log "  meson.build 'frida-*.X' file-string refs in lib/*/"
+
+# -- 17e. C/C++/Vala source: leading-underscore _frida_* / _frida-* identifiers --
+# Pass 1c uses `\bfrida_` which doesn't match `_frida_` because `_` is
+# a word character (no word boundary between `_` and `f`). Result:
+# generated C bindings like `_frida_sctp_connection_emit_transport_packet`
+# survive into glue files (p2p-glue.c) and Vala source like
+# `get_frida_helper_32_blob` survives in yszint-helper-process.vala
+# (the resource-compiler-generated getters take their name from the
+# input file's basename, which doesn't have the leading underscore in
+# the inputs but DOES when concatenated with `get_`).
+find "$REPO_ROOT/subprojects" \( "${PRUNE_ARGS[@]}" \) -prune -o \
+    -type f \( -name '*.c' -o -name '*.h' -o -name '*.cpp' -o -name '*.cc' \
+               -o -name '*.hpp' -o -name '*.hh' -o -name '*.vala' -o -name '*.vapi' \) \
+    -print0 2>/dev/null | xargs -0 -r sed -i \
+    -e "s/_${UP}_/_${ST}_/g"
+log "  C/C++/Vala leading-underscore _${UP}_ identifiers"
+
+# -- 17f. C++ source: Pass-1c-equivalent for .cpp / .cc / .hpp / .hh --
+# Pass 1c's scope is *.c *.h *.vala *.vapi — not C++. gumv8core.cpp uses
+# FRIDA_VERSION (defined by config.h via meson cdata), which is now
+# YSZINT_VERSION. Without this pass, every .cpp file that uses
+# FRIDA_VERSION or Frida{Type} fails to compile.
+find "$REPO_ROOT/subprojects" \( "${PRUNE_ARGS[@]}" \) -prune -o \
+    -type f \( -name '*.cpp' -o -name '*.cc' -o -name '*.hpp' -o -name '*.hh' \) \
+    -print0 2>/dev/null | xargs -0 -r sed -i \
+    -e "s/${UP_U}_/${ST_U}_/g" \
+    -e "s/\\b${UP}_/${ST}_/g" \
+    -e "s/${UP_P}\([A-Z][a-zA-Z]*\)/${ST_P}\1/g"
+log "  C++ .cpp/.cc/.hpp/.hh identifier prefixes (Pass-1c equivalent)"
+
+# -- 17g. Targeted rename of internal lib/codegen refs in src/meson.build --
+# Pass 16h renames the FILES (e.g. lib/base/yszint-linux.vapi), but
+# subprojects/frida-core/src/meson.build still references them by their
+# OLD name in `--pkg=frida-linux`, custom_target('frida-data-X'), output:
+# 'frida-data-X.vapi' etc. We CAN'T blanket-rename `frida-` in src/meson.build
+# because that would also rename `--pkg=frida-gum-1.0`, `--pkg=frida-gum-linux-1.0`,
+# which must remain matching the frida-gum subproject's installed pkg-config.
+#
+# Solution: rename only the internal-component names that Pass 16h actually
+# renamed on disk in src/, lib/, etc. Enumerated explicitly to keep this
+# script auditable.
+LIBNAMES=(
+    # src/yszint-core.{h,vapi,gir} (the main library; output as libyszint-core)
+    core
+    # lib/*/yszint-X.{c,h,vapi} (already renamed on disk by 16h)
+    linux atomics base payload pipe netif selinux helper-backend helper-process helper
+    # lib/base/yszint-{darwin,tvos,jni,perf-event,linux-bpf}.{c,h,vapi}
+    darwin tvos jni perf-event linux-bpf
+    # src/yszint-data-{android,helper-backend,helper-process,icons,agent,darwin,simmy,compiler,barebone}.{vapi,h,c}
+    data-android data-helper-backend data-helper-process data-icons data-agent
+    data-darwin data-simmy data-compiler data-barebone
+)
+for name in "${LIBNAMES[@]}"; do
+    for sp in subprojects/frida-core; do
+        [[ -d "$REPO_ROOT/$sp" ]] || continue
+        find "$REPO_ROOT/$sp" -name meson.build \( "${PRUNE_ARGS[@]}" \) -prune -o \
+            -name meson.build -print0 2>/dev/null | xargs -0 -r sed -i \
+            -e "s|'${UP}-${name}|'${ST}-${name}|g" \
+            -e "s|\"${UP}-${name}|\"${ST}-${name}|g" \
+            -e "s|=${UP}-${name}|=${ST}-${name}|g" \
+            -e "s|/${UP}-${name}|/${ST}-${name}|g"
+    done
+done
+log "  Targeted rename of internal lib/codegen refs (${#LIBNAMES[@]} names)"
+
+# -- 17g_post. frida-python / frida-tools meson.build: dependency('frida-core-1.0') --
+# frida-python and frida-tools subproject root meson.builds resolve
+# their dependency on frida-core via `dependency('frida-core-1.0', ...)`.
+# We renamed frida-core's pkg-config to yszint-core-1.0 (via Pass 17g
+# rewrites + frida-core's own meson.override_dependency call), so these
+# consumer references must match.
+for mb in subprojects/frida-python/meson.build subprojects/frida-tools/meson.build; do
+    [[ -f "$REPO_ROOT/$mb" ]] || continue
+    sed -i \
+        -e "s|dependency('${UP}-core-|dependency('${ST}-core-|g" \
+        -e "s|dependency(\"${UP}-core-|dependency(\"${ST}-core-|g" \
+        "$REPO_ROOT/$mb"
+done
+log "  frida-python/frida-tools dependency('frida-core-1.0') refs"
+
+# -- 17h_pre. lib/{agent,gadget}/meson.build: modulate.py symbol args --
+# Pass 16e renames frida_libc_shim_init/_deinit/on_load/on_unload inside
+# *.py files. But the meson.build INVOKES modulate.py with these as
+# string-literal arguments:
+#   operations = ['--move', 'constructor', 'frida_libc_shim_init', 'first']
+# Result: modulate.py is given 'frida_libc_shim_init' to look up, but the
+# binary contains 'yszint_libc_shim_init' → 'no constructor named ...'.
+for mb in subprojects/frida-core/lib/agent/meson.build subprojects/frida-core/lib/gadget/meson.build; do
+    [[ -f "$REPO_ROOT/$mb" ]] || continue
+    sed -i \
+        -e "s/'${UP}_libc_shim_init'/'${ST}_libc_shim_init'/g" \
+        -e "s/'${UP}_libc_shim_deinit'/'${ST}_libc_shim_deinit'/g" \
+        -e "s/'${UP}_on_load'/'${ST}_on_load'/g" \
+        -e "s/'${UP}_on_unload'/'${ST}_on_unload'/g" \
+        -e "s/'${UP}-agent-modulated'/'${ST}-agent-modulated'/g" \
+        -e "s/'lib${UP}-agent-modulated'/'lib${ST}-agent-modulated'/g" \
+        -e "s/'${UP}-gadget-modulated'/'${ST}-gadget-modulated'/g" \
+        -e "s/'lib${UP}-gadget-modulated'/'lib${ST}-gadget-modulated'/g" \
+        "$REPO_ROOT/$mb"
+done
+log "  lib/{agent,gadget}/meson.build modulate.py args + output names"
+
+# -- 17h. Resource-compiler .resources namespace = Frida.Data.X --
+# The resource compiler reads `namespace = Frida.Data.X` from .resources
+# files to generate Vala code like `namespace Frida.Data.X { ... }`. The
+# .vala files referencing this expect `Yszint.Data.X` (because Pass 1a
+# already rewrote the calling .vala code). Rewrite the .resources files
+# so the resource compiler emits the matching namespace.
+find "$REPO_ROOT/subprojects" \( "${PRUNE_ARGS[@]}" \) -prune -o \
+    -type f -name '*.resources' \
+    -print0 2>/dev/null | xargs -0 -r sed -i \
+    -e "s/namespace = ${UP_P}\.Data/namespace = ${ST_P}.Data/g" \
+    -e "s/namespace = ${UP_P}\\b/namespace = ${ST_P}/g"
+log "  .resources 'namespace = ${UP_P}.Data.*' attributes"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DONE
