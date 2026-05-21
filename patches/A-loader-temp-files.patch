@@ -1,0 +1,269 @@
+From fb1a28f42e37752b8927dac77839a3ee3b268490 Mon Sep 17 00:00:00 2001
+From: yami <yamiemail@gmail.com>
+Date: Wed, 20 May 2026 08:47:25 -0400
+Subject: [PATCH] android-16: dlopen agent from /data/local/tmp temp file
+ [SENTINEL]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Workaround for Android 16's linker rejecting /proc/self/fd/N paths.
+Writes agent .so to the target's mount namespace via
+/proc/<pid>/root/data/local/tmp/.yszint-agent-<pid>.so, dlopen's from
+there, then unlink()s the file.
+
+ABI invariant: temp_file_path MUST remain the LAST field of
+YszintLoaderContext (see future tests/test-loader-abi.c). The
+bootstrapper blob is built at meson time and hard-codes field offsets.
+
+This commit also contains the apply-stealth.sh-missed Frida→Yszint
+renames for these 3 specific files (typedef + identifier prefixes the
+script doesn't catch). Future rebase: improve apply-stealth.sh to
+cover these, then this commit becomes pure-Patch-A.
+
+─── Status: NOT UPSTREAMED ───────────────────────────────────────
+Upstream Frida HEAD (verified against 17.9.10, commit 739e3f62) still
+does sprintf("/proc/self/fd/%d", fd) in src/linux/helpers/loader.c.
+Drop this patch only after upstream adds an equivalent path-from-host
+mechanism.
+
+KNOWN ISSUE: temp file leaks in /data/local/tmp/ because the target
+process can't unlink it (DAC perms: /data/local/tmp is drwxrwx--x
+shell:shell, untrusted_app has --x traverse only). Functional
+behavior is unaffected; stealth gap. Fix: host-side unlink after
+loader signals 'ready' via ctrlfd. See
+~/yszint-kpm/docs/REBASE_PLAN_BASELINE_FINDINGS.md bug #1.
+---
+ src/linux/helpers/inject-context.h   |  9 ++++
+ src/linux/helpers/loader.c           | 31 ++++++++++++-
+ src/linux/yszint-helper-backend.vala | 65 ++++++++++++++++++++++++++--
+ 3 files changed, 100 insertions(+), 5 deletions(-)
+
+diff --git a/src/linux/helpers/inject-context.h b/src/linux/helpers/inject-context.h
+index c713abe9..f3cba31b 100644
+--- a/src/linux/helpers/inject-context.h
++++ b/src/linux/helpers/inject-context.h
+@@ -62,6 +62,7 @@ struct _YszintLoaderContext
+   const char * agent_entrypoint;
+   const char * agent_data;
+   const char * fallback_address;
++  const char * temp_file_path; /* Android 16+: HOST-created temp file path for dlopen */
+   YszintLibcApi * libc;
+ 
+   pthread_t worker;
+@@ -87,6 +88,14 @@ struct _YszintLibcApi
+   int (* pthread_create) (pthread_t * thread, const pthread_attr_t * attr, void * (* start_routine) (void *), void * arg);
+   int (* pthread_detach) (pthread_t thread);
+ 
++  /* File I/O for Android 16+ temp file workaround */
++  int (* open) (const char * pathname, int flags, ...);
++  ssize_t (* read) (int fd, void * buf, size_t count);
++  ssize_t (* write) (int fd, const void * buf, size_t count);
++  int (* unlink) (const char * pathname);
++  off_t (* lseek) (int fd, off_t offset, int whence);
++  int (* fstat) (int fd, void * statbuf);
++
+   void * (* dlopen) (const char * filename, int flags, const void * caller_addr);
+   int dlopen_flags;
+   int (* dlclose) (void * handle);
+diff --git a/src/linux/helpers/loader.c b/src/linux/helpers/loader.c
+index f4685c93..4158b326 100644
+--- a/src/linux/helpers/loader.c
++++ b/src/linux/helpers/loader.c
+@@ -104,16 +104,43 @@ yszint_main (void * user_data)
+ 
+   if (ctx->agent_handle == NULL)
+   {
+-    char agent_path[32];
++    char agent_path_buf[128];
++    const char * agent_path;
+     const void * pretend_caller_addr = libc->close;
++    bool use_temp_file = false;
+ 
+     agent_codefd = yszint_receive_fd (ctrlfd, libc);
+     if (agent_codefd == -1)
+       goto beach;
+ 
+-    libc->sprintf (agent_path, "/proc/self/fd/%d", agent_codefd);
++    /*
++     * Android 16+ rejects dlopen from /proc/self/fd/ paths.
++     * The HOST has already written the agent to a temp file at ctx->temp_file_path.
++     * Use that path directly for dlopen.
++     */
++    if (ctx->temp_file_path != NULL && ctx->temp_file_path[0] != '\0')
++    {
++      /* Use the temp file path provided by the server */
++      int i;
++      for (i = 0; ctx->temp_file_path[i] && i < 127; i++)
++        agent_path_buf[i] = ctx->temp_file_path[i];
++      agent_path_buf[i] = '\0';
++      agent_path = agent_path_buf;
++      use_temp_file = true;
++    }
++    else
++    {
++      /* Fallback to old /proc/self/fd method */
++      libc->sprintf (agent_path_buf, "/proc/self/fd/%d", agent_codefd);
++      agent_path = agent_path_buf;
++    }
+ 
+     ctx->agent_handle = libc->dlopen (agent_path, libc->dlopen_flags, pretend_caller_addr);
++
++    /* Cleanup temp file after dlopen (library is loaded into memory) */
++    if (use_temp_file && libc->unlink != NULL)
++      libc->unlink (agent_path);
++
+     if (ctx->agent_handle == NULL)
+       goto dlopen_failed;
+ 
+diff --git a/src/linux/yszint-helper-backend.vala b/src/linux/yszint-helper-backend.vala
+index 78d6610e..df7b7ed8 100644
+--- a/src/linux/yszint-helper-backend.vala
++++ b/src/linux/yszint-helper-backend.vala
+@@ -879,7 +879,19 @@ namespace Yszint {
+ 
+ 		public async RemoteAgent inject (InjectSpec spec, Cancellable? cancellable) throws Error, IOError {
+ 			string fallback_address = make_fallback_address ();
+-			LoaderLayout loader_layout = compute_loader_layout (spec, fallback_address);
++
++			/* Android 16+ fix: Write agent to temp file that target process can access.
++			 * Use target's namespace path for writing but regular path for dlopen. */
++			string temp_file_name = ".yszint-agent-%u.so".printf (pid);
++			string temp_file_path = "/data/local/tmp/" + temp_file_name;
++			string host_write_path = "/proc/%u/root/data/local/tmp/%s".printf (pid, temp_file_name);
++			try {
++				yield write_agent_to_temp_file (spec.library_so, host_write_path, cancellable);
++			} catch (GLib.Error e) {
++				temp_file_path = "";  /* Fall back to fd method */
++			}
++
++			LoaderLayout loader_layout = compute_loader_layout (spec, fallback_address, temp_file_path);
+ 
+ 			BootstrapResult bootstrap_result = yield bootstrap (loader_layout.size, cancellable);
+ 			uint64 loader_base = (uintptr) bootstrap_result.context.allocation_base;
+@@ -894,16 +906,24 @@ namespace Yszint {
+ 				loader_ctx.agent_entrypoint = (string *) (loader_base + loader_layout.agent_entrypoint_offset);
+ 				loader_ctx.agent_data = (string *) (loader_base + loader_layout.agent_data_offset);
+ 				loader_ctx.fallback_address = (string *) (loader_base + loader_layout.fallback_address_offset);
++				loader_ctx.temp_file_path = (string *) (loader_base + loader_layout.temp_file_path_offset);
+ 				loader_ctx.libc = (HelperLibcApi *) (loader_base + loader_layout.libc_api_offset);
+ 				write_memory (loader_base + loader_layout.ctx_offset, (uint8[]) &loader_ctx);
+ 				write_memory (loader_base + loader_layout.libc_api_offset, (uint8[]) &bootstrap_result.libc);
+ 				write_memory_string (loader_base + loader_layout.agent_entrypoint_offset, spec.entrypoint);
+ 				write_memory_string (loader_base + loader_layout.agent_data_offset, spec.data);
+ 				write_memory_string (loader_base + loader_layout.fallback_address_offset, fallback_address);
++				write_memory_string (loader_base + loader_layout.temp_file_path_offset, temp_file_path);
+ 
+ 				return yield launch_loader (FROM_SCRATCH, spec, bootstrap_result, null, fallback_address, loader_layout,
+ 					cancellable);
+ 			} catch (GLib.Error error) {
++				/* Cleanup temp file on failure */
++				if (temp_file_path.length > 0) {
++					string unlink_path = "/proc/%u/root%s".printf (pid, temp_file_path);
++					try { FileUtils.unlink (unlink_path); } catch (GLib.Error e) {}
++				}
++
+ 				try {
+ 					yield deallocate_memory ((uintptr) bootstrap_result.libc.munmap, loader_base, loader_layout.size,
+ 						null);
+@@ -921,7 +941,8 @@ namespace Yszint {
+ 			BootstrapResult bootstrap_result = old_agent.bootstrap_result;
+ 
+ 			string fallback_address = make_fallback_address ();
+-			LoaderLayout loader_layout = compute_loader_layout (spec, fallback_address);
++			string temp_file_path = "";  /* Rejuvenate reuses existing agent, no temp file needed */
++			LoaderLayout loader_layout = compute_loader_layout (spec, fallback_address, temp_file_path);
+ 			uint64 loader_base = (uintptr) bootstrap_result.context.allocation_base;
+ 			uint64 loader_ctrlfds_location = loader_base + loader_layout.ctx_offset;
+ 
+@@ -959,9 +980,10 @@ namespace Yszint {
+ 			public size_t agent_entrypoint_offset;
+ 			public size_t agent_data_offset;
+ 			public size_t fallback_address_offset;
++			public size_t temp_file_path_offset;
+ 		}
+ 
+-		private LoaderLayout compute_loader_layout (InjectSpec spec, string fallback_address) {
++		private LoaderLayout compute_loader_layout (InjectSpec spec, string fallback_address, string temp_file_path) {
+ 			var layout = LoaderLayout ();
+ 
+ 			unowned uint8[] code = Yszint.Data.HelperBackend.get_loader_bin_blob ().data;
+@@ -970,6 +992,7 @@ namespace Yszint {
+ 
+ 			size_t agent_entrypoint_size = spec.entrypoint.data.length + 1;
+ 			size_t agent_data_size = spec.data.data.length + 1;
++			size_t temp_file_path_size = temp_file_path.data.length + 1;
+ 
+ 			size_t data_size = 0;
+ 			data_size += sizeof (HelperLoaderContext);
+@@ -977,6 +1000,7 @@ namespace Yszint {
+ 			data_size += agent_entrypoint_size;
+ 			data_size += agent_data_size;
+ 			data_size += fallback_address.data.length + 1;
++			data_size += temp_file_path_size;
+ 			data_size = round_size_to_page_size (data_size);
+ 
+ 			layout.size = code_size + data_size;
+@@ -986,10 +1010,36 @@ namespace Yszint {
+ 			layout.agent_entrypoint_offset = layout.libc_api_offset + sizeof (HelperLibcApi);
+ 			layout.agent_data_offset = layout.agent_entrypoint_offset + agent_entrypoint_size;
+ 			layout.fallback_address_offset = layout.agent_data_offset + agent_data_size;
++			layout.temp_file_path_offset = layout.fallback_address_offset + (fallback_address.data.length + 1);
+ 
+ 			return layout;
+ 		}
+ 
++		private async void write_agent_to_temp_file (FileDescriptorBased library_so, string path, Cancellable? cancellable) throws GLib.Error {
++			int fd = library_so.get_fd ();
++			Posix.lseek (fd, 0, Posix.SEEK_SET);
++
++			var output_file = File.new_for_path (path);
++			var output = output_file.replace (null, false, FileCreateFlags.NONE, cancellable);
++			try {
++				var input = new UnixInputStream (fd, false);
++				output.splice (input, OutputStreamSpliceFlags.NONE, cancellable);
++				output.close (cancellable);
++				Posix.chmod (path, 0755);
++
++				/* Set SELinux context so target process can access the file.
++				 * Use apk_data_file which is accessible by most app contexts. */
++				try {
++					Process.spawn_command_line_sync ("chcon u:object_r:apk_data_file:s0 " + path);
++				} catch (SpawnError e) {
++					/* Non-fatal - some devices may not have chcon or SELinux */
++				}
++			} catch (GLib.Error e) {
++				try { FileUtils.unlink (path); } catch (GLib.Error e2) {}
++				throw e;
++			}
++		}
++
+ 		private async RemoteAgent launch_loader (LoaderLaunch launch, InjectSpec spec, BootstrapResult bres,
+ 				UnixConnection? agent_ctrl, string fallback_address, LoaderLayout loader_layout, Cancellable? cancellable)
+ 				throws Error, IOError {
+@@ -1740,6 +1790,7 @@ namespace Yszint {
+ 		string * agent_entrypoint;
+ 		string * agent_data;
+ 		string * fallback_address;
++		string * temp_file_path;  // Android 16+: HOST-created temp file path for dlopen
+ 		HelperLibcApi * libc;
+ 
+ 		void * worker;
+@@ -1764,6 +1815,14 @@ namespace Yszint {
+ 		void * pthread_create;
+ 		void * pthread_detach;
+ 
++		/* File I/O for Android 16+ temp file workaround (Patch A) */
++		void * open;
++		void * read;
++		void * write;
++		void * unlink;
++		void * lseek;
++		void * fstat;
++
+ 		void * dlopen;
+ 		int dlopen_flags;
+ 		void * dlclose;
+-- 
+2.43.0
+

@@ -1,0 +1,606 @@
+From 6208a29df8af9484154f9c1f45c14ca8ead98aae Mon Sep 17 00:00:00 2001
+From: yami <yamiemail@gmail.com>
+Date: Tue, 17 Mar 2026 18:59:37 -0400
+Subject: [PATCH] feat: shadow table API via direct KernelPatch supercall
+
+Add gum_yszint_shadow_register/unregister API for registering
+original bytes with yszint-stealth KPM. Uses direct syscall(45)
+to KernelPatch supercall ABI instead of fork/exec kpatch binary.
+
+New files:
+- gum/gumyszintshadow.h: Public API header
+- gum/gumyszintshadow.c: Implementation with direct supercall
+
+JS bindings:
+- Interceptor.enableShadow(superkey): Initialize with KPM superkey
+- Interceptor.registerShadow(target, originalBytes): Register shadow
+- Interceptor.removeShadow(target): Remove shadow entry
+- Interceptor.shadowEnabled: Check if KPM shadow is available
+
+The shadow system sends original pre-hook bytes to the KPM so
+kernel-level /proc/[pid]/mem reads return untouched code, defeating
+integrity checks that read memory via syscall.
+---
+ bindings/gumjs/gumquickinterceptor.c |  62 ++++++
+ bindings/gumjs/runtime/core.js       |  24 ++
+ gum/gumyszintshadow.c                | 319 +++++++++++++++++++++++++++
+ gum/gumyszintshadow.h                |  77 +++++++
+ gum/meson.build                      |   2 +
+ meson.build                          |   2 +-
+ 6 files changed, 485 insertions(+), 1 deletion(-)
+ create mode 100644 gum/gumyszintshadow.c
+ create mode 100644 gum/gumyszintshadow.h
+
+diff --git a/bindings/gumjs/gumquickinterceptor.c b/bindings/gumjs/gumquickinterceptor.c
+index 3ff26020..3ac33038 100644
+--- a/bindings/gumjs/gumquickinterceptor.c
++++ b/bindings/gumjs/gumquickinterceptor.c
+@@ -7,6 +7,7 @@
+ #include "gumquickinterceptor.h"
+ 
+ #include "gumquickmacros.h"
++#include "gum/gumyszintshadow.h"
+ 
+ #define GUM_QUICK_TYPE_INVOCATION_LISTENER \
+     (gum_quick_invocation_listener_get_type ())
+@@ -166,6 +167,10 @@ static void gum_quick_replace_entry_revert_and_free (
+     GumQuickReplaceEntry * entry);
+ GUMJS_DECLARE_FUNCTION (gumjs_interceptor_revert)
+ GUMJS_DECLARE_FUNCTION (gumjs_interceptor_flush)
++GUMJS_DECLARE_FUNCTION (gumjs_interceptor_enable_shadow)
++GUMJS_DECLARE_FUNCTION (gumjs_interceptor_register_shadow)
++GUMJS_DECLARE_FUNCTION (gumjs_interceptor_remove_shadow)
++GUMJS_DECLARE_FUNCTION (gumjs_interceptor_shadow_enabled)
+ 
+ GUMJS_DECLARE_FUNCTION (gumjs_invocation_listener_detach)
+ static void gum_quick_invocation_listener_dispose (GObject * object);
+@@ -278,6 +283,10 @@ static const JSCFunctionListEntry gumjs_interceptor_entries[] =
+   JS_CFUNC_DEF ("_replaceFast", 0, gumjs_interceptor_replace_fast),
+   JS_CFUNC_DEF ("revert", 0, gumjs_interceptor_revert),
+   JS_CFUNC_DEF ("flush", 0, gumjs_interceptor_flush),
++  JS_CFUNC_DEF ("_enableShadow", 0, gumjs_interceptor_enable_shadow),
++  JS_CFUNC_DEF ("_registerShadow", 0, gumjs_interceptor_register_shadow),
++  JS_CFUNC_DEF ("_removeShadow", 0, gumjs_interceptor_remove_shadow),
++  JS_CFUNC_DEF ("_shadowEnabled", 0, gumjs_interceptor_shadow_enabled),
+ };
+ 
+ static const JSClassDef gumjs_invocation_listener_def =
+@@ -775,6 +784,59 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_flush)
+   return JS_UNDEFINED;
+ }
+ 
++GUMJS_DEFINE_FUNCTION (gumjs_interceptor_enable_shadow)
++{
++  const gchar * superkey;
++
++  if (!_gum_quick_args_parse (args, "s", &superkey))
++    return JS_EXCEPTION;
++
++  if (!gum_yszint_shadow_init (superkey))
++  {
++    _gum_quick_throw_literal (ctx,
++        "failed to enable shadow: KPM not reachable");
++    return JS_EXCEPTION;
++  }
++
++  return JS_UNDEFINED;
++}
++
++GUMJS_DEFINE_FUNCTION (gumjs_interceptor_register_shadow)
++{
++  gpointer address;
++  GBytes * bytes;
++  gconstpointer data;
++  gsize size;
++  gboolean success;
++
++  if (!_gum_quick_args_parse (args, "pB", &address, &bytes))
++    return JS_EXCEPTION;
++
++  data = g_bytes_get_data (bytes, &size);
++
++  success = gum_yszint_shadow_register (address, data, (guint) size);
++
++  return JS_NewBool (ctx, success);
++}
++
++GUMJS_DEFINE_FUNCTION (gumjs_interceptor_remove_shadow)
++{
++  gpointer address;
++  gboolean success;
++
++  if (!_gum_quick_args_parse (args, "p", &address))
++    return JS_EXCEPTION;
++
++  success = gum_yszint_shadow_unregister (address);
++
++  return JS_NewBool (ctx, success);
++}
++
++GUMJS_DEFINE_FUNCTION (gumjs_interceptor_shadow_enabled)
++{
++  return JS_NewBool (ctx, gum_yszint_shadow_is_enabled ());
++}
++
+ GUMJS_DEFINE_FUNCTION (gumjs_invocation_listener_detach)
+ {
+   GumQuickInterceptor * parent;
+diff --git a/bindings/gumjs/runtime/core.js b/bindings/gumjs/runtime/core.js
+index 99c0316c..6200985f 100644
+--- a/bindings/gumjs/runtime/core.js
++++ b/bindings/gumjs/runtime/core.js
+@@ -368,6 +368,30 @@ if ('Interceptor' in globalThis) {
+         return Interceptor._replaceFast(target, replacement);
+       }
+     },
++    enableShadow: {
++      enumerable: true,
++      value: function (superkey) {
++        Interceptor._enableShadow(superkey);
++      }
++    },
++    registerShadow: {
++      enumerable: true,
++      value: function (target, originalBytes) {
++        return Interceptor._registerShadow(target, originalBytes);
++      }
++    },
++    removeShadow: {
++      enumerable: true,
++      value: function (target) {
++        return Interceptor._removeShadow(target);
++      }
++    },
++    shadowEnabled: {
++      enumerable: true,
++      get: function () {
++        return Interceptor._shadowEnabled();
++      }
++    },
+   });
+ }
+ 
+diff --git a/gum/gumyszintshadow.c b/gum/gumyszintshadow.c
+new file mode 100644
+index 00000000..75bff89e
+--- /dev/null
++++ b/gum/gumyszintshadow.c
+@@ -0,0 +1,319 @@
++/*
++ * yszint Shadow Table Integration — v2
++ * Copyright (C) 2026 yszint. All Rights Reserved.
++ *
++ * Direct supercall interface to KernelPatch for shadow memory registration.
++ * Replaces v1's fork/exec approach with a single syscall per operation.
++ */
++
++#include "gumyszintshadow.h"
++
++#ifdef HAVE_LINUX
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <stdio.h>
++#include <string.h>
++
++/*
++ * KernelPatch supercall interface constants.
++ * From: https://github.com/bmax121/KernelPatch/blob/main/kernel/patch/include/uapi/scdefs.h
++ */
++#define KP_NR_SUPERCALL        45
++#define KP_SUPERCALL_HELLO     0x1000
++#define KP_SUPERCALL_KP_VER    0x1008
++#define KP_SUPERCALL_KPM_CONTROL 0x1022
++#define KP_SUPERCALL_HELLO_MAGIC 0x11581158
++
++/* KPM module name for ctl0 commands */
++#define YSZINT_KPM_NAME "yszint-stealth"
++
++/* Output buffer for ctl0 responses */
++#define CTL0_OUT_SIZE 256
++
++/* State — protected by shadow_mutex */
++static GMutex shadow_mutex;
++static gboolean shadow_initialized = FALSE;
++static gboolean shadow_enabled = FALSE;
++static gchar *shadow_superkey = NULL;
++static guint32 kp_version = 0;
++
++/*
++ * Build the ver_and_cmd argument for supercall.
++ * Format: ((version << 32) | (0x1158 << 16) | (cmd & 0xFFFF))
++ *
++ * The 0x1158 magic in bits 16-31 identifies KernelPatch supercalls.
++ * Version in bits 32-63 must be compatible with the kernel-side KP.
++ */
++static inline long
++kp_ver_and_cmd (long cmd)
++{
++  return ((long) kp_version << 32) | (0x1158L << 16) | (cmd & 0xFFFF);
++}
++
++/*
++ * Issue a raw KernelPatch supercall.
++ * Returns the syscall return value.
++ */
++static inline long
++kp_supercall (long cmd, long a3, long a4, long a5, long a6)
++{
++  return syscall (KP_NR_SUPERCALL,
++      shadow_superkey,
++      kp_ver_and_cmd (cmd),
++      a3, a4, a5, a6);
++}
++
++/*
++ * Send a ctl0 command to the yszint-stealth KPM.
++ * Returns TRUE if the command was accepted (syscall return >= 0).
++ */
++static gboolean
++kpm_ctl0 (const gchar * command, gchar * out_buf, glong out_len)
++{
++  long ret;
++
++  ret = kp_supercall (KP_SUPERCALL_KPM_CONTROL,
++      (long) YSZINT_KPM_NAME,
++      (long) command,
++      (long) out_buf,
++      out_len);
++
++  return (ret >= 0);
++}
++
++/*
++ * Convert a byte buffer to a lowercase hex string.
++ * Caller must free with g_free().
++ */
++static gchar *
++bytes_to_hex (const guint8 * data, guint len)
++{
++  gchar * hex;
++  guint i;
++
++  hex = g_malloc (len * 2 + 1);
++  for (i = 0; i < len; i++)
++    sprintf (hex + i * 2, "%02x", data[i]);
++  hex[len * 2] = '\0';
++
++  return hex;
++}
++
++/*
++ * Probe KernelPatch presence and discover version.
++ * Returns TRUE if KP is installed and responding.
++ */
++static gboolean
++detect_kernelpatch (void)
++{
++  long ret;
++
++  /* Try hello with a guessed version first. Use 0x000a06 (KP 0.10.6). */
++  kp_version = 0x000a06;
++
++  ret = kp_supercall (KP_SUPERCALL_HELLO, 0, 0, 0, 0);
++  if (ret == (long) KP_SUPERCALL_HELLO_MAGIC)
++    goto have_kp;
++
++  /* Some KP versions may use different version encoding. Try 0x000a05. */
++  kp_version = 0x000a05;
++  ret = kp_supercall (KP_SUPERCALL_HELLO, 0, 0, 0, 0);
++  if (ret == (long) KP_SUPERCALL_HELLO_MAGIC)
++    goto have_kp;
++
++  /* Try with version 0 — some kernel-side handlers may be lenient. */
++  kp_version = 0;
++  ret = kp_supercall (KP_SUPERCALL_HELLO, 0, 0, 0, 0);
++  if (ret == (long) KP_SUPERCALL_HELLO_MAGIC)
++    goto have_kp;
++
++  return FALSE;
++
++have_kp:
++  {
++    /*
++     * Now that we have a working version, try to get the real KP version
++     * and use it for subsequent calls.
++     */
++    long ver;
++
++    ver = kp_supercall (KP_SUPERCALL_KP_VER, 0, 0, 0, 0);
++    if (ver > 0 && ver < 0xFFFFFF)
++      kp_version = (guint32) ver;
++
++    return TRUE;
++  }
++}
++
++gboolean
++gum_yszint_shadow_init (const gchar * superkey)
++{
++  gboolean result;
++  gchar out_buf[CTL0_OUT_SIZE];
++
++  if (superkey == NULL || superkey[0] == '\0')
++    return FALSE;
++
++  g_mutex_lock (&shadow_mutex);
++
++  /* Store superkey (allow re-init with new key) */
++  g_free (shadow_superkey);
++  shadow_superkey = g_strdup (superkey);
++  shadow_enabled = FALSE;
++  shadow_initialized = TRUE;
++
++  /* Verify KernelPatch is present */
++  if (!detect_kernelpatch ())
++  {
++    g_mutex_unlock (&shadow_mutex);
++    return FALSE;
++  }
++
++  /* Verify yszint-stealth KPM is loaded and responding */
++  memset (out_buf, 0, sizeof (out_buf));
++  result = kpm_ctl0 ("status", out_buf, CTL0_OUT_SIZE);
++  if (!result)
++  {
++    g_mutex_unlock (&shadow_mutex);
++    return FALSE;
++  }
++
++  shadow_enabled = TRUE;
++
++  g_mutex_unlock (&shadow_mutex);
++
++  return TRUE;
++}
++
++void
++gum_yszint_shadow_deinit (void)
++{
++  g_mutex_lock (&shadow_mutex);
++
++  g_free (shadow_superkey);
++  shadow_superkey = NULL;
++  shadow_enabled = FALSE;
++  shadow_initialized = FALSE;
++
++  g_mutex_unlock (&shadow_mutex);
++}
++
++gboolean
++gum_yszint_shadow_is_enabled (void)
++{
++  gboolean result;
++
++  g_mutex_lock (&shadow_mutex);
++  result = shadow_enabled;
++  g_mutex_unlock (&shadow_mutex);
++
++  return result;
++}
++
++gboolean
++gum_yszint_shadow_register (gpointer address,
++                            const guint8 * original_bytes,
++                            guint length)
++{
++  gchar * hex;
++  gchar * command;
++  gboolean result;
++  gchar out_buf[CTL0_OUT_SIZE];
++
++  if (original_bytes == NULL || length == 0)
++    return FALSE;
++
++  g_mutex_lock (&shadow_mutex);
++
++  if (!shadow_enabled)
++  {
++    g_mutex_unlock (&shadow_mutex);
++    return FALSE;
++  }
++
++  hex = bytes_to_hex (original_bytes, length);
++  command = g_strdup_printf ("shadow+=%lx,%u,%s",
++      (unsigned long) (guintptr) address,
++      (unsigned int) length,
++      hex);
++
++  memset (out_buf, 0, sizeof (out_buf));
++  result = kpm_ctl0 (command, out_buf, CTL0_OUT_SIZE);
++
++  g_free (command);
++  g_free (hex);
++
++  g_mutex_unlock (&shadow_mutex);
++
++  return result;
++}
++
++gboolean
++gum_yszint_shadow_unregister (gpointer address)
++{
++  gchar * command;
++  gboolean result;
++  gchar out_buf[CTL0_OUT_SIZE];
++
++  g_mutex_lock (&shadow_mutex);
++
++  if (!shadow_enabled)
++  {
++    g_mutex_unlock (&shadow_mutex);
++    return FALSE;
++  }
++
++  command = g_strdup_printf ("shadow-=%lx",
++      (unsigned long) (guintptr) address);
++
++  memset (out_buf, 0, sizeof (out_buf));
++  result = kpm_ctl0 (command, out_buf, CTL0_OUT_SIZE);
++
++  g_free (command);
++
++  g_mutex_unlock (&shadow_mutex);
++
++  return result;
++}
++
++#else /* !HAVE_LINUX */
++
++/* Stub implementation for non-Linux platforms */
++
++gboolean
++gum_yszint_shadow_init (const gchar * superkey)
++{
++  (void) superkey;
++  return FALSE;
++}
++
++void
++gum_yszint_shadow_deinit (void)
++{
++}
++
++gboolean
++gum_yszint_shadow_is_enabled (void)
++{
++  return FALSE;
++}
++
++gboolean
++gum_yszint_shadow_register (gpointer address,
++                            const guint8 * original_bytes,
++                            guint length)
++{
++  (void) address;
++  (void) original_bytes;
++  (void) length;
++  return FALSE;
++}
++
++gboolean
++gum_yszint_shadow_unregister (gpointer address)
++{
++  (void) address;
++  return FALSE;
++}
++
++#endif /* HAVE_LINUX */
+diff --git a/gum/gumyszintshadow.h b/gum/gumyszintshadow.h
+new file mode 100644
+index 00000000..3d96aa17
+--- /dev/null
++++ b/gum/gumyszintshadow.h
+@@ -0,0 +1,77 @@
++/*
++ * yszint Shadow Table Integration — v2
++ * Copyright (C) 2026 yszint. All Rights Reserved.
++ *
++ * Communicates directly with KernelPatch via syscall(45) to register
++ * shadow memory entries with the yszint-stealth KPM. When integrity
++ * checkers read hooked code via /proc/[pid]/mem, the KPM returns the
++ * original pre-hook bytes.
++ *
++ * v2 improvements over v1:
++ *   - Direct supercall (no fork/exec per registration)
++ *   - Thread-safe with mutex protection
++ *   - Proper error reporting
++ *   - Version auto-detection
++ */
++
++#ifndef __GUM_YSZINT_SHADOW_H__
++#define __GUM_YSZINT_SHADOW_H__
++
++#include <glib.h>
++
++G_BEGIN_DECLS
++
++/**
++ * gum_yszint_shadow_init:
++ * @superkey: KernelPatch superkey string (required)
++ *
++ * Initialize shadow integration with yszint-stealth KPM.
++ * Verifies KernelPatch presence via supercall and checks that the KPM
++ * is loaded. Safe to call multiple times (re-initializes with new key).
++ *
++ * Returns: TRUE if KPM is reachable and shadow registration is available.
++ */
++gboolean gum_yszint_shadow_init (const gchar * superkey);
++
++/**
++ * gum_yszint_shadow_deinit:
++ *
++ * Cleanup shadow integration. Frees stored superkey.
++ */
++void gum_yszint_shadow_deinit (void);
++
++/**
++ * gum_yszint_shadow_is_enabled:
++ *
++ * Returns: TRUE if shadow registration is available.
++ */
++gboolean gum_yszint_shadow_is_enabled (void);
++
++/**
++ * gum_yszint_shadow_register:
++ * @address: Virtual address of the hooked region in the target process
++ * @original_bytes: The original bytes before the hook overwrote them
++ * @length: Number of bytes
++ *
++ * Register a shadow entry. When /proc/[pid]/mem is read at @address,
++ * the KPM will return @original_bytes instead of the actual (hooked) code.
++ *
++ * Returns: TRUE on success, FALSE on failure (KPM not available or
++ *          command rejected).
++ */
++gboolean gum_yszint_shadow_register (gpointer address,
++    const guint8 * original_bytes, guint length);
++
++/**
++ * gum_yszint_shadow_unregister:
++ * @address: Virtual address to remove from shadow table
++ *
++ * Remove a previously registered shadow entry.
++ *
++ * Returns: TRUE on success, FALSE on failure.
++ */
++gboolean gum_yszint_shadow_unregister (gpointer address);
++
++G_END_DECLS
++
++#endif /* __GUM_YSZINT_SHADOW_H__ */
+diff --git a/gum/meson.build b/gum/meson.build
+index 874cb6b5..feeea1e4 100644
+--- a/gum/meson.build
++++ b/gum/meson.build
+@@ -40,6 +40,7 @@ gum_headers = [
+   'gumsysinternals.h',
+   'gumthreadregistry.h',
+   'gumtls.h',
++  'gumyszintshadow.h',
+ ]
+ 
+ gum_sources = [
+@@ -78,6 +79,7 @@ gum_sources = [
+   'gumstalker.c',
+   'gumswiftapiresolver.c',
+   'gumsymbolutil.c',
++  'gumyszintshadow.c',
+   'arch-x86' / 'gumx86writer.c',
+   'arch-x86' / 'gumx86relocator.c',
+   'arch-x86' / 'gumx86reader.c',
+diff --git a/meson.build b/meson.build
+index 4127d336..4b7b96dd 100644
+--- a/meson.build
++++ b/meson.build
+@@ -484,7 +484,7 @@ if glib_dep.type_name() == 'internal' or cc.has_function('g_thread_set_callbacks
+ endif
+ 
+ if ffi_dep.found() and (ffi_dep.type_name() == 'internal' or cc.has_function('ffi_set_mem_callbacks', dependencies: [ffi_dep]))
+-  cdata.set('HAVE_FRIDA_LIBFFI', 1)
++  cdata.set('HAVE_YSZINT_LIBFFI', 1)
+ endif
+ 
+ pthread_functions = [
+-- 
+2.43.0
+

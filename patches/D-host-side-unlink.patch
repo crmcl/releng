@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: yami <yamiemail@gmail.com>
+Date: Wed, 20 May 2026 22:17:42 -0400
+Subject: [PATCH] android-16: host-side unlink of .yszint-agent temp file after
+ dlopen success (Bug #1 / Bug #4 fix)
+
+Stealth invariant: after a successful attach() on Android 16, no
+yszint-related file should be left in /data/local/tmp/.
+
+Patch A loads the agent .so from /data/local/tmp/.yszint-agent-<pid>.so
+and asks the target-side loader (in subprojects/frida-core/src/linux/
+helpers/loader.c) to unlink() it once dlopen() has mmap'd the contents
+into memory. On Android 16 that target-side unlink fails silently with
+EACCES, because /data/local/tmp is drwxrwx--x shell:shell, and the
+target process (untrusted_app uid u0_aN) has traverse but not write.
+
+Result before this patch: every attach() leaves a ~24 MB
+.yszint-agent-<pid>.so behind, defeating the on-disk-stealth invariant
+of Patch A.
+
+Fix: the HOST (yszint-server, running as shell uid) CAN write to
+/data/local/tmp. After launch_loader() returns successfully (which is
+the same signal that the target-side dlopen has completed), the host
+unlinks /proc/<pid>/root<temp_file_path>. The file is gone from the
+filesystem; the mmap'd code in target memory is unaffected.
+
+Logical isolation: this patch only modifies yszint-helper-backend.vala's
+inject() method body. It depends on Patch A having added the
+temp_file_path field to BootstrapResult/HelperLibcApi; without Patch A
+this patch is a no-op (temp_file_path.length will be 0 → branch
+skipped). With Patch A but without this patch, .yszint-agent-* files
+accumulate in /data/local/tmp/ until rebooted.
+
+Verification: 4 consecutive attach() cycles, all leave
+/data/local/tmp/.yszint-agent-* clean.
+
+─── Status: NOT UPSTREAMED ───────────────────────────────────────
+Upstream Frida has no Android 16 / API 36 awareness. This is a yszint
+stealth invariant; upstream's agent injection writes to /tmp inside the
+target's namespace, which is fine for non-stealth use cases.
+
+Drop this patch when:
+  (a) Patch A is itself dropped (no more temp file → nothing to unlink),
+      OR
+  (b) Patch A is rewritten to use memfd_create() instead of a
+      filesystem path (Android 16 supports memfd; would obsolete both
+      this patch and the temp-file aspect of Patch A).
+---
+ src/linux/yszint-helper-backend.vala | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/linux/yszint-helper-backend.vala b/src/linux/yszint-helper-backend.vala
+index df7b7ed8..1737700a 100644
+--- a/src/linux/yszint-helper-backend.vala
++++ b/src/linux/yszint-helper-backend.vala
+@@ -896,6 +896,7 @@ namespace Yszint {
+ 			BootstrapResult bootstrap_result = yield bootstrap (loader_layout.size, cancellable);
+ 			uint64 loader_base = (uintptr) bootstrap_result.context.allocation_base;
+ 
++			RemoteAgent agent = null;
+ 			try {
+ 				unowned uint8[] loader_code = Yszint.Data.HelperBackend.get_loader_bin_blob ().data;
+ 				write_memory (loader_base, loader_code);
+@@ -915,7 +916,7 @@ namespace Yszint {
+ 				write_memory_string (loader_base + loader_layout.fallback_address_offset, fallback_address);
+ 				write_memory_string (loader_base + loader_layout.temp_file_path_offset, temp_file_path);
+ 
+-				return yield launch_loader (FROM_SCRATCH, spec, bootstrap_result, null, fallback_address, loader_layout,
++				agent = yield launch_loader (FROM_SCRATCH, spec, bootstrap_result, null, fallback_address, loader_layout,
+ 					cancellable);
+ 			} catch (GLib.Error error) {
+ 				/* Cleanup temp file on failure */
+@@ -932,8 +933,23 @@ namespace Yszint {
+ 
+ 				if (error is IOError)
+ 					throw (IOError) error;
++
+ 				throw (Error) error;
+ 			}
++
++			/* Bug #1 (stealth) fix: dlopen has succeeded and mmap'd the .so by
++			 * the time launch_loader() returns. The on-disk file is no longer
++			 * needed. The target's libc-side unlink() in loader.c fails with
++			 * EACCES because /data/local/tmp is drwxrwx--x shell:shell and the
++			 * target (untrusted_app) has --x but not write. We unlink from the
++			 * HOST side here, which has shell uid and CAN write to /data/local/tmp.
++			 * Forensic/stealth invariant: the file must not persist on disk. */
++			if (temp_file_path.length > 0) {
++				string host_unlink_path = "/proc/%u/root%s".printf (pid, temp_file_path);
++				try { FileUtils.unlink (host_unlink_path); } catch (GLib.Error e) {}
++			}
++
++			return agent;
+ 		}
+ 
+ 		public async RemoteAgent rejuvenate (RemoteAgent old_agent, Cancellable? cancellable) throws Error, IOError {

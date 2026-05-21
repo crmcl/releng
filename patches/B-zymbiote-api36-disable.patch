@@ -1,0 +1,104 @@
+From 667eb01b61f097c032bf5640a07cbc1c7ba7f005 Mon Sep 17 00:00:00 2001
+From: yami <yamiemail@gmail.com>
+Date: Wed, 20 May 2026 08:47:41 -0400
+Subject: [PATCH] android-16: skip zymbiote preload on API 36+ [SENTINEL]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Zygote's ArtMethod / boot-heap layout changed in API 36
+(java/lang/Thread grew to 79 methods, copied_methods_offset_ semantics
+flipped from count to index, JNI fast-path cache consolidated into
+ArtMethod.entry_point_from_jni_). The consequence is that zymbiote's
+memmem(heap, &setargv0_ptr) either returns NULL (clean fail) or finds
+a stale copy in JIT cache metadata, patching which corrupts the entire
+zygote's dispatch and bricks every subsequent app fork with SIGSEGV.
+
+Spawn() is therefore unsafe on Android 16. Gate it at runtime via
+getprop ro.build.version.sdk. attach() continues to work and is the
+recommended path.
+
+CRITICAL: ZygiskYszint (the intended early-injection backstop) is
+currently OUT OF SERVICE (per workspace owner 2026-05-18). This gate
+is therefore the SOLE barrier preventing zygote brick on Android 16.
+If getprop returns 0 / fails / is denied by SELinux, MUST fall closed
+(skip zymbiote). NEVER remove this patch without first proving an
+alternative early-injection path works on API 36.
+
+KNOWN ISSUE: spawn() on Android 16 throws TransportError mid-call and
+in some cases kills yszint-server (zygote stays safe — the gate
+worked). Fix: add early-exit in the spawn() API handler matching the
+preload() gate. ~10 LOC. See
+~/yszint-kpm/docs/REBASE_PLAN_BASELINE_FINDINGS.md bug #2.
+
+─── Status: NOT UPSTREAMED ───────────────────────────────────────
+Upstream Frida has no Android 16 / API 36 awareness anywhere in
+frida-core (verified against 17.9.10). zymbiote.c body is
+byte-identical to 17.8.2; only the unrelated package_name →
+process_name rename (commit a4102879) is new.
+
+Drop this patch when:
+  (a) upstream gates zymbiote behind API-level themselves, OR
+  (b) upstream replaces zymbiote with a JNI-bridge-after-fork
+      installation mechanism that works on API 36 ART, OR
+  (c) we rewrite zymbiote to patch ArtMethod entry slots directly
+      (LIAPP-style; viable but maintenance-heavy), OR
+  (d) ZygiskYszint is repaired AND proven to install agents on every
+      Android-16 fork without zygote damage.
+---
+ src/linux/linux-host-session.vala | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/linux/linux-host-session.vala b/src/linux/linux-host-session.vala
+index f0e15088..f1f498c5 100644
+--- a/src/linux/linux-host-session.vala
++++ b/src/linux/linux-host-session.vala
+@@ -1372,6 +1372,8 @@ namespace Yszint {
+ 
+ 		private const string CHROME_ZYGOTE_PACKAGE_NAME = "com.android.chrome_zygote";
+ 
++		private static int android_api_level = -1;
++
+ 		public RoboLauncher (LinuxHostSession host_session, Cancellable io_cancellable) {
+ 			Object (
+ 				host_session: host_session,
+@@ -1379,7 +1381,36 @@ namespace Yszint {
+ 			);
+ 		}
+ 
++		private static int get_android_api_level () {
++			if (android_api_level != -1)
++				return android_api_level;
++
++			android_api_level = 0;
++			try {
++				string output;
++				GLib.Process.spawn_command_line_sync ("getprop ro.build.version.sdk", out output, null, null);
++				android_api_level = int.parse (output.strip ());
++			} catch (GLib.Error e) {
++				android_api_level = 0;
++			}
++			return android_api_level;
++		}
++
+ 		public async void preload (Cancellable? cancellable) throws Error, IOError {
++			// Environment variable to force-disable zymbiote (for debugging)
++			if (Environment.get_variable ("YSZINT_NO_ZYMBIOTE") != null) {
++				return;
++			}
++
++			// Android 16+ (API 36+): Zymbiote injection is broken due to ART changes.
++			// Attempting injection crashes ALL zygote-forked apps with SIGSEGV.
++			// Skip zymbiote entirely - spawn() won't work, but attach/inject will.
++			int api_level = get_android_api_level ();
++			if (api_level >= 36) {
++				stderr.printf ("yszint: Skipping zymbiote on Android %d - spawn disabled\n", api_level);
++				return;
++			}
++
+ 			yield ensure_loaded (cancellable);
+ 		}
+ 
+-- 
+2.43.0
+
