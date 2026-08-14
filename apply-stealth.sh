@@ -332,6 +332,52 @@ if [[ -f "$EXT_C" ]]; then
     log "  Python C extension macros (legacy extension.c)"
 fi
 
+# Python bindgen (17.16+) emitted-identifier stealth. The GIR-driven code
+# generator (frida_bindgen/) hardcodes frida-derived names that the C/H
+# identifier passes cannot reach because they are produced at generation
+# time. Rewrite them so the GENERATED C matches the stealthed core (which
+# exports ${ST}_* and installs ${ST}-core.h) and leaks no frida identifiers.
+# PRESERVES the `_frida` Python module/import name and the `--frida-gir`
+# CLI option (public surface). find/-name is glob-safe (no shell expansion).
+if [[ -d "$BINDGEN_DIR" ]]; then
+    # (a) Core-API calls + generated #include must match the stealthed core.
+    find "$BINDGEN_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name '*.py' \) -print0 \
+        | xargs -0 sed -E -i \
+            -e "s/#include <${UP}-core\\.h>/#include <${ST}-core.h>/g" \
+            -e "s/\\b${UP}_(init_with_runtime|init|shutdown|deinit|get_main_context|unref|version_string|version)\\b/${ST}_\\1/g"
+    # (b) GObject C-type namespace prefix strip (GIR types are ${ST_P}*, not ${UP_P}*)
+    #     plus the module docstring; both keep the "_frida" module name intact.
+    find "$BINDGEN_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name '*.py' \) -print0 \
+        | xargs -0 sed -i \
+            -e "s/g_str_has_prefix (cname, \"${UP_P}\")/g_str_has_prefix (cname, \"${ST_P}\")/g" \
+            -e "s/\"_frida\", \"${UP_P}\"/\"_frida\", \"${ST_P}\"/g"
+    # (c) Internal generated identifiers: definitions and uses both live under
+    #     frida_bindgen/, so a uniform rename stays build-consistent.
+    find "$BINDGEN_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name '*.py' \) -print0 \
+        | xargs -0 sed -i \
+            -e "s/Py${UP_P}_/Py${ST_P}_/g" \
+            -e "s/${UP_P}Python/${ST_P}Python/g" \
+            -e "s/${UP}_python_/${ST}_python_/g" \
+            -e "s/${UP_U}_PYTHON_/${ST_U}_PYTHON_/g" \
+            -e "s/${UP_U}_IS_PYTHON_/${ST_U}_IS_PYTHON_/g" \
+            -e "s/is_${UP}_list/is_${ST}_list/g" \
+            -e "s/is_${UP}_options/is_${ST}_options/g" \
+            -e "s/${UP}_current_cancellable/${ST}_current_cancellable/g" \
+            -e "s/${UP}_exception_by_error_code/${ST}_exception_by_error_code/g" \
+            -e "s/_${UP}_dispatch/_${ST}_dispatch/g" \
+            -e "s/_${UP}_original/_${ST}_original/g"
+    log "  Python bindgen generated identifiers (core API, type prefix, internals)"
+fi
+
+# Python bindgen tests: point at the stealthed GIR filename (${ST_P}-1.0.gir).
+# The --frida-gir CLI option name is preserved; only the .gir path changes.
+PYTESTS="$REPO_ROOT/subprojects/frida-python/tests"
+if [[ -d "$PYTESTS" ]]; then
+    find "$PYTESTS" -type f \( -name '*.sh' -o -name '*.py' \) -print0 \
+        | xargs -0 sed -i -e "s/${UP_P}-1\\.0\\.gir/${ST_P}-1.0.gir/g"
+    log "  Python bindgen test GIR filename"
+fi
+
 # Python RPC protocol
 sed_in "$REPO_ROOT/subprojects/frida-python" "*.py" \
     -e "s/\"${UP}:rpc\"/\"${ST}:rpc\"/g" \
