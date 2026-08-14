@@ -1,8 +1,11 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 0f8bbba752ebfedafdc4531408f35bba52a2ea64 Mon Sep 17 00:00:00 2001
 From: yami <yamiemail@gmail.com>
 Date: Wed, 20 May 2026 22:17:42 -0400
 Subject: [PATCH] android-16: host-side unlink of .yszint-agent temp file after
  dlopen success (Bug #1 / Bug #4 fix)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Stealth invariant: after a successful attach() on Android 16, no
 yszint-related file should be left in /data/local/tmp/.
@@ -46,14 +49,14 @@ Drop this patch when:
       filesystem path (Android 16 supports memfd; would obsolete both
       this patch and the temp-file aspect of Patch A).
 ---
- src/linux/yszint-helper-backend.vala | 19 ++++++++++++++++++-
- 1 file changed, 18 insertions(+), 1 deletion(-)
+ src/linux/yszint-helper-backend.vala | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/src/linux/yszint-helper-backend.vala b/src/linux/yszint-helper-backend.vala
-index df7b7ed8..1737700a 100644
+index f98a4929..ddcb0437 100644
 --- a/src/linux/yszint-helper-backend.vala
 +++ b/src/linux/yszint-helper-backend.vala
-@@ -896,6 +896,7 @@ namespace Yszint {
+@@ -909,6 +909,7 @@ namespace Yszint {
  			BootstrapResult bootstrap_result = yield bootstrap (loader_layout.size, cancellable);
  			uint64 loader_base = (uintptr) bootstrap_result.context.allocation_base;
  
@@ -61,7 +64,7 @@ index df7b7ed8..1737700a 100644
  			try {
  				unowned uint8[] loader_code = Yszint.Data.HelperBackend.get_loader_bin_blob ().data;
  				write_memory (loader_base, loader_code);
-@@ -915,7 +916,7 @@ namespace Yszint {
+@@ -928,7 +929,7 @@ namespace Yszint {
  				write_memory_string (loader_base + loader_layout.fallback_address_offset, fallback_address);
  				write_memory_string (loader_base + loader_layout.temp_file_path_offset, temp_file_path);
  
@@ -70,7 +73,7 @@ index df7b7ed8..1737700a 100644
  					cancellable);
  			} catch (GLib.Error error) {
  				/* Cleanup temp file on failure */
-@@ -932,8 +933,23 @@ namespace Yszint {
+@@ -945,8 +946,23 @@ namespace Yszint {
  
  				if (error is IOError)
  					throw (IOError) error;
@@ -94,3 +97,6 @@ index df7b7ed8..1737700a 100644
  		}
  
  		public async RemoteAgent rejuvenate (RemoteAgent old_agent, Cancellable? cancellable) throws Error, IOError {
+-- 
+2.43.0
+

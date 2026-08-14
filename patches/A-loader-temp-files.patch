@@ -1,4 +1,4 @@
-From fb1a28f42e37752b8927dac77839a3ee3b268490 Mon Sep 17 00:00:00 2001
+From 5b3daddff5511042a56517b6f7284e2ffe22ddb3 Mon Sep 17 00:00:00 2001
 From: yami <yamiemail@gmail.com>
 Date: Wed, 20 May 2026 08:47:25 -0400
 Subject: [PATCH] android-16: dlopen agent from /data/local/tmp temp file
@@ -35,9 +35,9 @@ loader signals 'ready' via ctrlfd. See
 ~/yszint-kpm/docs/REBASE_PLAN_BASELINE_FINDINGS.md bug #1.
 ---
  src/linux/helpers/inject-context.h   |  9 ++++
- src/linux/helpers/loader.c           | 31 ++++++++++++-
+ src/linux/helpers/loader.c           | 38 +++++++++++++---
  src/linux/yszint-helper-backend.vala | 65 ++++++++++++++++++++++++++--
- 3 files changed, 100 insertions(+), 5 deletions(-)
+ 3 files changed, 102 insertions(+), 10 deletions(-)
 
 diff --git a/src/linux/helpers/inject-context.h b/src/linux/helpers/inject-context.h
 index c713abe9..f3cba31b 100644
@@ -67,10 +67,10 @@ index c713abe9..f3cba31b 100644
    int dlopen_flags;
    int (* dlclose) (void * handle);
 diff --git a/src/linux/helpers/loader.c b/src/linux/helpers/loader.c
-index f4685c93..4158b326 100644
+index 83f0f518..85b41e44 100644
 --- a/src/linux/helpers/loader.c
 +++ b/src/linux/helpers/loader.c
-@@ -104,16 +104,43 @@ yszint_main (void * user_data)
+@@ -105,23 +105,47 @@ yszint_main (void * user_data)
  
    if (ctx->agent_handle == NULL)
    {
@@ -84,12 +84,21 @@ index f4685c93..4158b326 100644
      if (agent_codefd == -1)
        goto beach;
  
--    libc->sprintf (agent_path, "/proc/self/fd/%d", agent_codefd);
-+    /*
-+     * Android 16+ rejects dlopen from /proc/self/fd/ paths.
-+     * The HOST has already written the agent to a temp file at ctx->temp_file_path.
-+     * Use that path directly for dlopen.
-+     */
+     /*
+-     * Spell out our PID instead of using /proc/self so the path resolves the same
+-     * from outside the process. An attached debugger handles the dynamic linker's
+-     * library-load event by reading the new object from this path; with /proc/self
+-     * that read hits the debugger's own fd table and fails, wedging the thread mid
+-     * dlopen (), so the agent never finishes loading.
++     * Android 16+ rejects dlopen from /proc/self/fd/ paths, so the HOST has
++     * already written the agent to a temp file at ctx->temp_file_path; use that
++     * path directly. Fall back to the PID-explicit /proc/<pid>/fd path
++     * (upstream 17.12, f51327fa) rather than /proc/self: an attached debugger
++     * handling the dynamic linker's library-load event reads the new object
++     * from this path, and /proc/self would hit the debugger's own fd table and
++     * wedge the thread mid dlopen ().
+      */
+-    libc->sprintf (agent_path, "/proc/%d/fd/%d", yszint_getpid (), agent_codefd);
 +    if (ctx->temp_file_path != NULL && ctx->temp_file_path[0] != '\0')
 +    {
 +      /* Use the temp file path provided by the server */
@@ -102,8 +111,8 @@ index f4685c93..4158b326 100644
 +    }
 +    else
 +    {
-+      /* Fallback to old /proc/self/fd method */
-+      libc->sprintf (agent_path_buf, "/proc/self/fd/%d", agent_codefd);
++      /* Fallback: PID-explicit fd path (upstream 17.12 fix), not /proc/self */
++      libc->sprintf (agent_path_buf, "/proc/%d/fd/%d", yszint_getpid (), agent_codefd);
 +      agent_path = agent_path_buf;
 +    }
  
@@ -117,10 +126,10 @@ index f4685c93..4158b326 100644
        goto dlopen_failed;
  
 diff --git a/src/linux/yszint-helper-backend.vala b/src/linux/yszint-helper-backend.vala
-index 78d6610e..df7b7ed8 100644
+index 3337b98e..f98a4929 100644
 --- a/src/linux/yszint-helper-backend.vala
 +++ b/src/linux/yszint-helper-backend.vala
-@@ -879,7 +879,19 @@ namespace Yszint {
+@@ -892,7 +892,19 @@ namespace Yszint {
  
  		public async RemoteAgent inject (InjectSpec spec, Cancellable? cancellable) throws Error, IOError {
  			string fallback_address = make_fallback_address ();
@@ -141,7 +150,7 @@ index 78d6610e..df7b7ed8 100644
  
  			BootstrapResult bootstrap_result = yield bootstrap (loader_layout.size, cancellable);
  			uint64 loader_base = (uintptr) bootstrap_result.context.allocation_base;
-@@ -894,16 +906,24 @@ namespace Yszint {
+@@ -907,16 +919,24 @@ namespace Yszint {
  				loader_ctx.agent_entrypoint = (string *) (loader_base + loader_layout.agent_entrypoint_offset);
  				loader_ctx.agent_data = (string *) (loader_base + loader_layout.agent_data_offset);
  				loader_ctx.fallback_address = (string *) (loader_base + loader_layout.fallback_address_offset);
@@ -166,7 +175,7 @@ index 78d6610e..df7b7ed8 100644
  				try {
  					yield deallocate_memory ((uintptr) bootstrap_result.libc.munmap, loader_base, loader_layout.size,
  						null);
-@@ -921,7 +941,8 @@ namespace Yszint {
+@@ -934,7 +954,8 @@ namespace Yszint {
  			BootstrapResult bootstrap_result = old_agent.bootstrap_result;
  
  			string fallback_address = make_fallback_address ();
@@ -176,7 +185,7 @@ index 78d6610e..df7b7ed8 100644
  			uint64 loader_base = (uintptr) bootstrap_result.context.allocation_base;
  			uint64 loader_ctrlfds_location = loader_base + loader_layout.ctx_offset;
  
-@@ -959,9 +980,10 @@ namespace Yszint {
+@@ -972,9 +993,10 @@ namespace Yszint {
  			public size_t agent_entrypoint_offset;
  			public size_t agent_data_offset;
  			public size_t fallback_address_offset;
@@ -188,7 +197,7 @@ index 78d6610e..df7b7ed8 100644
  			var layout = LoaderLayout ();
  
  			unowned uint8[] code = Yszint.Data.HelperBackend.get_loader_bin_blob ().data;
-@@ -970,6 +992,7 @@ namespace Yszint {
+@@ -983,6 +1005,7 @@ namespace Yszint {
  
  			size_t agent_entrypoint_size = spec.entrypoint.data.length + 1;
  			size_t agent_data_size = spec.data.data.length + 1;
@@ -196,7 +205,7 @@ index 78d6610e..df7b7ed8 100644
  
  			size_t data_size = 0;
  			data_size += sizeof (HelperLoaderContext);
-@@ -977,6 +1000,7 @@ namespace Yszint {
+@@ -990,6 +1013,7 @@ namespace Yszint {
  			data_size += agent_entrypoint_size;
  			data_size += agent_data_size;
  			data_size += fallback_address.data.length + 1;
@@ -204,7 +213,7 @@ index 78d6610e..df7b7ed8 100644
  			data_size = round_size_to_page_size (data_size);
  
  			layout.size = code_size + data_size;
-@@ -986,10 +1010,36 @@ namespace Yszint {
+@@ -999,10 +1023,36 @@ namespace Yszint {
  			layout.agent_entrypoint_offset = layout.libc_api_offset + sizeof (HelperLibcApi);
  			layout.agent_data_offset = layout.agent_entrypoint_offset + agent_entrypoint_size;
  			layout.fallback_address_offset = layout.agent_data_offset + agent_data_size;
@@ -241,7 +250,7 @@ index 78d6610e..df7b7ed8 100644
  		private async RemoteAgent launch_loader (LoaderLaunch launch, InjectSpec spec, BootstrapResult bres,
  				UnixConnection? agent_ctrl, string fallback_address, LoaderLayout loader_layout, Cancellable? cancellable)
  				throws Error, IOError {
-@@ -1740,6 +1790,7 @@ namespace Yszint {
+@@ -1753,6 +1803,7 @@ namespace Yszint {
  		string * agent_entrypoint;
  		string * agent_data;
  		string * fallback_address;
@@ -249,7 +258,7 @@ index 78d6610e..df7b7ed8 100644
  		HelperLibcApi * libc;
  
  		void * worker;
-@@ -1764,6 +1815,14 @@ namespace Yszint {
+@@ -1777,6 +1828,14 @@ namespace Yszint {
  		void * pthread_create;
  		void * pthread_detach;
  

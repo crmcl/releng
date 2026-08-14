@@ -1,0 +1,246 @@
+From b96840382672ddfb224b1b1039043e9aa6630d41 Mon Sep 17 00:00:00 2001
+From: yami <yamiemail@gmail.com>
+Date: Thu, 28 May 2026 19:13:12 -0400
+Subject: [PATCH] feat: persistent ctl0 service via open_service("yszint-ctl0")
+ [SENTINEL]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch E (part 2 of 2) — frida-core side. Depends on Patch E part 1
+(frida-gum: gum_yszint_kpm_ctl0) and Patch C (kp_supercall infra).
+
+Expose the KernelPatch-supercall ctl0 path as a generic Frida
+ServiceSession so Python clients can pipeline arbitrary KPM ctl0
+commands over the existing TLS control channel — eliminating the
+per-command `adb shell + ndkctl + kpatch` process fanout that capped
+sustained automation at ~30-50 min before the device's adb/fork
+plumbing buckled.
+
+New file:
+- src/linux/yszint-ctl0-service.vala: LinuxCtl0ServiceSession.
+  request({type:"ctl0", module, verb}) -> {ok, ret, reply}. Per-call
+  errors throw GLib.Error (INVALID_ARGUMENT for malformed requests) but
+  do NOT close the session; KPM ERR replies come back ok=true with the
+  byte count. Uses the real vardict_add(builder,key,Variant) helper.
+
+Modified:
+- server/server-glue.c: v1 PREREQUISITE — yszint_server_environment_
+  configure() now reads YSZINT_SUPERKEY from the env and calls
+  gum_yszint_shadow_init() once, priming the static shadow_superkey the
+  ctl0 path reads. WITHOUT this, the service runs in the server process
+  where no agent ever called Interceptor.enableShadow, so shadow_superkey
+  would be NULL and every request would fail. Best-effort: a missing key
+  / absent KPM must not block boot (init stores the key before its
+  non-blocking probe supercalls).
+- src/linux/linux-host-session.vala: dispatch "yszint-ctl0" in
+  do_open_service.
+- src/meson.build: list the new vala file.
+
+OPERATIONAL CONTRACT (new): YSZINT_SUPERKEY is now a server-STARTUP
+requirement, not just a shell convenience. If the autostart/launch path
+drops it, the ctl0 service goes silently dead (every request ret<0).
+
+─── Status: NOT UPSTREAMED ───────────────────────────────────────
+yszint-authored; no upstream Frida equivalent. The ctl0 ServiceSession,
+the server-side superkey priming, and the yszint-ctl0 dispatch exist
+only in yszint. Drop only if upstream Frida adds a native
+KernelPatch-supercall service mechanism (it has none as of 17.9.10).
+This [SENTINEL] tag exists so `git log --grep=SENTINEL` surfaces Patch E
+during a rebase (matching the A/B/C convention).
+---
+ server/server-glue.c               |  25 +++++++
+ src/linux/linux-host-session.vala  |   3 +
+ src/linux/yszint-ctl0-service.vala | 110 +++++++++++++++++++++++++++++
+ src/meson.build                    |   1 +
+ 4 files changed, 139 insertions(+)
+ create mode 100644 src/linux/yszint-ctl0-service.vala
+
+diff --git a/server/server-glue.c b/server/server-glue.c
+index 1b587843..e1f20a20 100644
+--- a/server/server-glue.c
++++ b/server/server-glue.c
+@@ -29,6 +29,7 @@ void CFLog (CFLogLevel level, CFStringRef format, ...);
+ 
+ #elif defined (HAVE_ANDROID)
+ # include <android/log.h>
++# include <gum/gumyszintshadow.h>
+ #else
+ # include <stdio.h>
+ #endif
+@@ -60,6 +61,30 @@ yszint_server_environment_configure (void)
+ 
+ #ifdef HAVE_ANDROID
+   yszint_selinux_patch_policy ();
++
++  /*
++   * Patch E (ctl0 service) prerequisite: prime the shadow/ctl0 supercall
++   * path from the launch environment so the persistent ctl0 ServiceSession
++   * can issue KernelPatch supercalls WITHOUT any agent having called
++   * Interceptor.enableShadow. gum_yszint_shadow_init() stores the superkey
++   * (g_strdup into the static shadow_superkey that kp_supercall reads).
++   *
++   * Best-effort: the return is intentionally ignored. A missing/empty key,
++   * an absent KernelPatch, or an unloaded KPM must NOT block server startup
++   * — gum_yszint_shadow_init() stores the key BEFORE probing and its probe
++   * supercalls are non-blocking (they return an error immediately if KP is
++   * absent), so the ctl0 service still receives the superkey and reports any
++   * per-call failure to its client.
++   *
++   * Operational contract: YSZINT_SUPERKEY must be present in the server's
++   * startup environment. If the autostart/launch path drops it, the ctl0
++   * service goes silently dead (every request returns a negative ret).
++   */
++  {
++    const gchar * superkey = g_getenv ("YSZINT_SUPERKEY");
++    if (superkey != NULL && superkey[0] != '\0')
++      gum_yszint_shadow_init (superkey);
++  }
+ #endif
+ }
+ 
+diff --git a/src/linux/linux-host-session.vala b/src/linux/linux-host-session.vala
+index b071c4dc..5ebc6fa4 100644
+--- a/src/linux/linux-host-session.vala
++++ b/src/linux/linux-host-session.vala
+@@ -462,6 +462,9 @@ namespace Yszint {
+ 			if (protocol == "syscall-trace")
+ 				return new LinuxSyscallTraceServiceSession ();
+ 
++			if (protocol == "yszint-ctl0")
++				return new LinuxCtl0ServiceSession ();
++
+ 			throw new Error.NOT_SUPPORTED ("Unsupported service address");
+ 		}
+ 
+diff --git a/src/linux/yszint-ctl0-service.vala b/src/linux/yszint-ctl0-service.vala
+new file mode 100644
+index 00000000..3060a24e
+--- /dev/null
++++ b/src/linux/yszint-ctl0-service.vala
+@@ -0,0 +1,110 @@
++namespace Yszint {
++	/**
++	 * Persistent KPM ctl0 dispatch service (Patch E).
++	 *
++	 * Exposes the supercall-based ctl0 path (built by Patch C for shadow
++	 * operations) as a generic Frida service. Client code opens it with
++	 * `device.open_service("yszint-ctl0")` and calls
++	 * `service.request({"type": "ctl0", "module": ..., "verb": ...})` to
++	 * dispatch any KPM ctl0 verb WITHOUT spawning a process per call —
++	 * collapsing the `adb shell + ndkctl + kpatch` fanout that caps
++	 * sustained automation.
++	 *
++	 * Superkey: the supercall path requires gum_yszint_shadow_init() to have
++	 * stored the KernelPatch superkey. yszint-server primes this at startup
++	 * from the YSZINT_SUPERKEY environment variable (see
++	 * server/server-glue.c, Patch E). No agent / Interceptor.enableShadow is
++	 * required.
++	 *
++	 * Lifecycle: created on open_service and usable until cancel() is called
++	 * or the parent transport drops. Per-call errors throw GLib.Error but do
++	 * NOT close the session (matches LinuxSyscallTraceServiceSession).
++	 *
++	 * Statelessness: the supercall path is stateless per-call, so multiple
++	 * clients each opening the service work without coordination.
++	 */
++	private sealed class LinuxCtl0ServiceSession : Object, ServiceSession {
++		/* Output buffer capacity — matches Patch C's CTL0_OUT_SIZE. */
++		private const int CTL0_OUT_SIZE = 256;
++
++		/* Sanity caps — request fields beyond these are rejected to defend
++		 * against accidental megabyte payloads. KPM verbs are short (sub-100
++		 * chars in practice). */
++		private const int MAX_MODULE_LEN = 64;
++		private const int MAX_VERB_LEN = 1024;
++
++		private bool closed = false;
++
++		public async void activate (Cancellable? cancellable) throws Error, IOError {
++			/* No state to spin up; the supercall path is per-request. */
++			if (closed)
++				throw new Error.INVALID_OPERATION ("Service is closed");
++		}
++
++		public async void cancel (Cancellable? cancellable) throws IOError {
++			if (closed)
++				return;
++			closed = true;
++			close ();
++		}
++
++		public async Variant request (Variant parameters, Cancellable? cancellable = null) throws Error, IOError {
++			if (closed)
++				throw new Error.INVALID_OPERATION ("Service is closed");
++
++			var reader = new VariantReader (parameters);
++
++			string type = reader.read_member ("type").get_string_value ();
++			reader.end_member ();
++			if (type != "ctl0")
++				throw new Error.INVALID_ARGUMENT ("Unsupported request type: %s", type);
++
++			if (!reader.has_member ("module"))
++				throw new Error.INVALID_ARGUMENT ("Missing 'module' field");
++			string module = reader.read_member ("module").get_string_value ();
++			reader.end_member ();
++			if (module.length == 0 || module.length > MAX_MODULE_LEN)
++				throw new Error.INVALID_ARGUMENT ("Invalid module length");
++
++			if (!reader.has_member ("verb"))
++				throw new Error.INVALID_ARGUMENT ("Missing 'verb' field");
++			string verb = reader.read_member ("verb").get_string_value ();
++			reader.end_member ();
++			if (verb.length == 0 || verb.length > MAX_VERB_LEN)
++				throw new Error.INVALID_ARGUMENT ("Invalid verb length");
++
++			/*
++			 * gum_yszint_kpm_ctl0 issues the supercall directly using the
++			 * superkey stored by gum_yszint_shadow_init(). If the superkey was
++			 * never set (YSZINT_SUPERKEY absent at server startup), or the KPM
++			 * is unreachable, the supercall returns a negative value — surfaced
++			 * to the client as ok=false / ret<0, NOT thrown.
++			 */
++			char out_buf[CTL0_OUT_SIZE];
++			Memory.set (out_buf, 0, CTL0_OUT_SIZE);
++
++			long ret = gum_yszint_kpm_ctl0 (module, verb, out_buf, CTL0_OUT_SIZE);
++
++			/* Defensive NUL-termination: bound the buffer before the (string)
++			 * cast in case the KPM filled every byte without a terminator. */
++			out_buf[CTL0_OUT_SIZE - 1] = '\0';
++			string reply = (string) out_buf;
++
++			var b = new VariantBuilder (VariantType.VARDICT);
++			vardict_add (b, "ok", new Variant.boolean (ret >= 0));
++			vardict_add (b, "ret", new Variant.int64 (ret));
++			vardict_add (b, "reply", new Variant.string (reply));
++			return b.end ();
++		}
++
++		private static void vardict_add (VariantBuilder b, string key, Variant val) {
++			b.add_value (new Variant.dict_entry (new Variant.string (key), new Variant.variant (val)));
++		}
++
++		/* Provided by frida-gum (Patch E header change). Direct kp_supercall:
++		 * parameterized module, raw long return. */
++		[CCode (cname = "gum_yszint_kpm_ctl0")]
++		private extern static long gum_yszint_kpm_ctl0 (string module, string command,
++			[CCode (array_length = false)] char[] out_buf, long out_len);
++	}
++}
+diff --git a/src/meson.build b/src/meson.build
+index 102b527d..b591fdee 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -334,6 +334,7 @@ if have_local_backend
+       'linux' / 'linjector.vala',
+       'linux' / 'linjector-glue.c',
+       'linux' / 'yszint-helper-process.vala',
++      'linux' / 'yszint-ctl0-service.vala',
+       'linux' / 'supersu.vala',
+     ]
+ 
+-- 
+2.43.0
+

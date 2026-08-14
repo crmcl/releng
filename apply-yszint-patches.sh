@@ -69,7 +69,7 @@ apply_patch() {
         echo "WARN: $subproject HEAD doesn't look stealth-applied; the patches may fail" >&2
     fi
 
-    git am --keep-non-patch "$patch_file"
+    git am --3way --keep-non-patch "$patch_file"
 
     popd >/dev/null
 }
@@ -83,11 +83,15 @@ apply_patch frida-core A-loader-temp-files.patch
 apply_patch frida-core B-zymbiote-api36-disable.patch
 apply_patch frida-core D-host-side-unlink.patch
 
-# ── frida-gum: C standalone ──
+# ── frida-gum: C, then E part 1 (E-gum depends on C's kp_supercall infra) ──
 apply_patch frida-gum  C-shadow-table-api.patch
+apply_patch frida-gum  E-ctl0-service-gum.patch
+
+# ── frida-core: E part 2 (ctl0 service; depends on E-gum's gum_yszint_kpm_ctl0) ──
+apply_patch frida-core E-ctl0-service-core.patch
 
 echo
-echo "✓ All 4 patches applied. Next:"
+echo "✓ All 6 patches applied. Next:"
 echo "    1. After Patch A: rebuild src/linux/helpers/artifacts/native/arm64/"
 echo "       (upstream's prebuilt loader.bin doesn't know temp_file_path):"
 echo "         cd subprojects/frida-core/src/linux/helpers"

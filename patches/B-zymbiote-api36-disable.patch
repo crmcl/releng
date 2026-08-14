@@ -1,4 +1,4 @@
-From 667eb01b61f097c032bf5640a07cbc1c7ba7f005 Mon Sep 17 00:00:00 2001
+From cc76b39f3f07d98290d3efe1734da0a2c8f5b057 Mon Sep 17 00:00:00 2001
 From: yami <yamiemail@gmail.com>
 Date: Wed, 20 May 2026 08:47:41 -0400
 Subject: [PATCH] android-16: skip zymbiote preload on API 36+ [SENTINEL]
@@ -50,10 +50,10 @@ Drop this patch when:
  1 file changed, 31 insertions(+)
 
 diff --git a/src/linux/linux-host-session.vala b/src/linux/linux-host-session.vala
-index f0e15088..f1f498c5 100644
+index cfa8a75b..b071c4dc 100644
 --- a/src/linux/linux-host-session.vala
 +++ b/src/linux/linux-host-session.vala
-@@ -1372,6 +1372,8 @@ namespace Yszint {
+@@ -1396,6 +1396,8 @@ namespace Yszint {
  
  		private const string CHROME_ZYGOTE_PACKAGE_NAME = "com.android.chrome_zygote";
  
@@ -62,8 +62,8 @@ index f0e15088..f1f498c5 100644
  		public RoboLauncher (LinuxHostSession host_session, Cancellable io_cancellable) {
  			Object (
  				host_session: host_session,
-@@ -1379,7 +1381,36 @@ namespace Yszint {
- 			);
+@@ -1412,7 +1414,36 @@ namespace Yszint {
+ 			gating_cancelled ();
  		}
  
 +		private static int get_android_api_level () {

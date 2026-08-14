@@ -1,4 +1,4 @@
-From 6208a29df8af9484154f9c1f45c14ca8ead98aae Mon Sep 17 00:00:00 2001
+From a7b3b5bde8a79a3f07bc85a4ee5b9c02f4bf7c82 Mon Sep 17 00:00:00 2001
 From: yami <yamiemail@gmail.com>
 Date: Tue, 17 Mar 2026 18:59:37 -0400
 Subject: [PATCH] feat: shadow table API via direct KernelPatch supercall
@@ -32,18 +32,18 @@ integrity checks that read memory via syscall.
  create mode 100644 gum/gumyszintshadow.h
 
 diff --git a/bindings/gumjs/gumquickinterceptor.c b/bindings/gumjs/gumquickinterceptor.c
-index 3ff26020..3ac33038 100644
+index e30578a8..7eb1f93b 100644
 --- a/bindings/gumjs/gumquickinterceptor.c
 +++ b/bindings/gumjs/gumquickinterceptor.c
-@@ -7,6 +7,7 @@
- #include "gumquickinterceptor.h"
+@@ -8,6 +8,7 @@
  
+ #include "gumquickcodewriter.h"
  #include "gumquickmacros.h"
 +#include "gum/gumyszintshadow.h"
  
  #define GUM_QUICK_TYPE_INVOCATION_LISTENER \
      (gum_quick_invocation_listener_get_type ())
-@@ -166,6 +167,10 @@ static void gum_quick_replace_entry_revert_and_free (
+@@ -190,6 +191,10 @@ static void gum_quick_replace_entry_revert_and_free (
      GumQuickReplaceEntry * entry);
  GUMJS_DECLARE_FUNCTION (gumjs_interceptor_revert)
  GUMJS_DECLARE_FUNCTION (gumjs_interceptor_flush)
@@ -54,7 +54,7 @@ index 3ff26020..3ac33038 100644
  
  GUMJS_DECLARE_FUNCTION (gumjs_invocation_listener_detach)
  static void gum_quick_invocation_listener_dispose (GObject * object);
-@@ -278,6 +283,10 @@ static const JSCFunctionListEntry gumjs_interceptor_entries[] =
+@@ -304,6 +309,10 @@ static const JSCFunctionListEntry gumjs_interceptor_entries[] =
    JS_CFUNC_DEF ("_replaceFast", 0, gumjs_interceptor_replace_fast),
    JS_CFUNC_DEF ("revert", 0, gumjs_interceptor_revert),
    JS_CFUNC_DEF ("flush", 0, gumjs_interceptor_flush),
@@ -65,7 +65,7 @@ index 3ff26020..3ac33038 100644
  };
  
  static const JSClassDef gumjs_invocation_listener_def =
-@@ -775,6 +784,59 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_flush)
+@@ -1162,6 +1171,59 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_flush)
    return JS_UNDEFINED;
  }
  
@@ -126,10 +126,10 @@ index 3ff26020..3ac33038 100644
  {
    GumQuickInterceptor * parent;
 diff --git a/bindings/gumjs/runtime/core.js b/bindings/gumjs/runtime/core.js
-index 99c0316c..6200985f 100644
+index 53d26d90..f635940f 100644
 --- a/bindings/gumjs/runtime/core.js
 +++ b/bindings/gumjs/runtime/core.js
-@@ -368,6 +368,30 @@ if ('Interceptor' in globalThis) {
+@@ -388,6 +388,30 @@ if ('Interceptor' in globalThis) {
          return Interceptor._replaceFast(target, replacement);
        }
      },
@@ -569,10 +569,10 @@ index 00000000..3d96aa17
 +
 +#endif /* __GUM_YSZINT_SHADOW_H__ */
 diff --git a/gum/meson.build b/gum/meson.build
-index 874cb6b5..feeea1e4 100644
+index b2507724..2f5cffd3 100644
 --- a/gum/meson.build
 +++ b/gum/meson.build
-@@ -40,6 +40,7 @@ gum_headers = [
+@@ -42,6 +42,7 @@ gum_headers = [
    'gumsysinternals.h',
    'gumthreadregistry.h',
    'gumtls.h',
@@ -580,7 +580,7 @@ index 874cb6b5..feeea1e4 100644
  ]
  
  gum_sources = [
-@@ -78,6 +79,7 @@ gum_sources = [
+@@ -83,6 +84,7 @@ gum_sources = [
    'gumstalker.c',
    'gumswiftapiresolver.c',
    'gumsymbolutil.c',
@@ -589,7 +589,7 @@ index 874cb6b5..feeea1e4 100644
    'arch-x86' / 'gumx86relocator.c',
    'arch-x86' / 'gumx86reader.c',
 diff --git a/meson.build b/meson.build
-index 4127d336..4b7b96dd 100644
+index 603f53b2..7d0d4347 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -484,7 +484,7 @@ if glib_dep.type_name() == 'internal' or cc.has_function('g_thread_set_callbacks

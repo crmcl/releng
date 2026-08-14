@@ -1,0 +1,144 @@
+From 26ad00c16eb515f191390f8241b4338b5aeef578 Mon Sep 17 00:00:00 2001
+From: yami <yamiemail@gmail.com>
+Date: Thu, 28 May 2026 19:12:57 -0400
+Subject: [PATCH] feat: expose gum_yszint_kpm_ctl0 for the persistent ctl0
+ service [SENTINEL]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch E (part 1 of 2) — frida-gum side.
+
+Add a public gum_yszint_kpm_ctl0() that issues the KernelPatch
+KPM_CONTROL supercall DIRECTLY (parameterized module, raw long return),
+reusing Patch C's kp_supercall infrastructure and shadow_superkey.
+
+This is NOT a wrapper of the internal static kpm_ctl0():
+- kpm_ctl0 hardcodes YSZINT_KPM_NAME and returns gboolean (truncating
+  the raw supercall return).
+- gum_yszint_kpm_ctl0 takes `module` as a parameter (so future KPMs work
+  without touching this file) and returns the raw long so callers can
+  distinguish a 0-byte-reply success from a negative-return failure.
+
+The static kpm_ctl0 is left untouched (its internal callers —
+shadow_init/register/unregister — still use it). shadow_mutex guards
+shadow_superkey against a concurrent re-init, matching the rest of the
+file. A matching #else stub returns -1 on non-Linux.
+
+Consumed by frida-core's LinuxCtl0ServiceSession (Patch E part 2).
+
+─── Status: NOT UPSTREAMED ───────────────────────────────────────
+yszint-authored; no upstream Frida equivalent. Exposes the
+KernelPatch-supercall ctl0 path built by Patch C as a generic entry
+point for the Frida ctl0 ServiceSession. Drop only if upstream Frida
+adds a native KernelPatch-supercall service mechanism (it has none as
+of 17.9.10). This [SENTINEL] tag exists so `git log --grep=SENTINEL`
+surfaces Patch E during a rebase (matching the A/B/C convention; Patch
+C was silently dropped in a prior rebase and went unnoticed for ~6h).
+---
+ gum/gumyszintshadow.c | 47 +++++++++++++++++++++++++++++++++++++++++++
+ gum/gumyszintshadow.h | 25 +++++++++++++++++++++++
+ 2 files changed, 72 insertions(+)
+
+diff --git a/gum/gumyszintshadow.c b/gum/gumyszintshadow.c
+index 75bff89e..ea71c1b6 100644
+--- a/gum/gumyszintshadow.c
++++ b/gum/gumyszintshadow.c
+@@ -81,6 +81,40 @@ kpm_ctl0 (const gchar * command, gchar * out_buf, glong out_len)
+   return (ret >= 0);
+ }
+ 
++/*
++ * Public ctl0 entry point (Patch E).
++ *
++ * Unlike the static kpm_ctl0 above, this:
++ *   - takes @module as a parameter (not hardcoded to YSZINT_KPM_NAME), so
++ *     future KPMs work without touching this file;
++ *   - issues kp_supercall DIRECTLY and returns the RAW long, so callers can
++ *     distinguish a 0-byte-reply success from a negative-return failure
++ *     (the gboolean truncation in kpm_ctl0 loses that distinction).
++ *
++ * Relies on gum_yszint_shadow_init() having stored shadow_superkey. The
++ * shadow_mutex guards shadow_superkey against a concurrent re-init.
++ */
++long
++gum_yszint_kpm_ctl0 (const gchar * module,
++                     const gchar * command,
++                     gchar * out_buf,
++                     glong out_len)
++{
++  long ret;
++
++  g_mutex_lock (&shadow_mutex);
++
++  ret = kp_supercall (KP_SUPERCALL_KPM_CONTROL,
++      (long) module,
++      (long) command,
++      (long) out_buf,
++      out_len);
++
++  g_mutex_unlock (&shadow_mutex);
++
++  return ret;
++}
++
+ /*
+  * Convert a byte buffer to a lowercase hex string.
+  * Caller must free with g_free().
+@@ -316,4 +350,17 @@ gum_yszint_shadow_unregister (gpointer address)
+   return FALSE;
+ }
+ 
++long
++gum_yszint_kpm_ctl0 (const gchar * module,
++                     const gchar * command,
++                     gchar * out_buf,
++                     glong out_len)
++{
++  (void) module;
++  (void) command;
++  (void) out_buf;
++  (void) out_len;
++  return -1;
++}
++
+ #endif /* HAVE_LINUX */
+diff --git a/gum/gumyszintshadow.h b/gum/gumyszintshadow.h
+index 3d96aa17..8115551a 100644
+--- a/gum/gumyszintshadow.h
++++ b/gum/gumyszintshadow.h
+@@ -72,6 +72,31 @@ gboolean gum_yszint_shadow_register (gpointer address,
+  */
+ gboolean gum_yszint_shadow_unregister (gpointer address);
+ 
++/**
++ * gum_yszint_kpm_ctl0:
++ * @module: KPM module name, e.g. "yszint-stealth"
++ * @command: Full command after the module name, e.g. "input:tap 540 1200 50",
++ *           "status", or "shadow+=12345678,4,90909090"
++ * @out_buf: Buffer for the KPM's reply (NUL-terminated on success)
++ * @out_len: Capacity of @out_buf in bytes
++ *
++ * Issue a ctl0 command to any KPM via a direct KernelPatch supercall.
++ * Requires gum_yszint_shadow_init() to have stored the superkey first.
++ * Unlike the internal (static) kpm_ctl0 helper, @module is a parameter
++ * (not hardcoded to yszint-stealth) and the raw supercall return is
++ * surfaced so callers can distinguish a 0-byte-reply success from a
++ * negative-return failure.
++ *
++ * Reused by the Frida ctl0 ServiceSession (Patch E).
++ *
++ * Returns: Raw supercall return — byte count of the reply on success,
++ *          negative on failure (e.g. KP missing / superkey rejected).
++ */
++long gum_yszint_kpm_ctl0 (const gchar * module,
++    const gchar * command,
++    gchar * out_buf,
++    glong out_len);
++
+ G_END_DECLS
+ 
+ #endif /* __GUM_YSZINT_SHADOW_H__ */
+-- 
+2.43.0
+
