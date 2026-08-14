@@ -340,19 +340,25 @@ fi
 # PRESERVES the `_frida` Python module/import name and the `--frida-gir`
 # CLI option (public surface). find/-name is glob-safe (no shell expansion).
 if [[ -d "$BINDGEN_DIR" ]]; then
-    # (a) Core-API calls + generated #include must match the stealthed core.
+    # (a) Core-API calls, error domain, and generated #include must match core.
     find "$BINDGEN_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name '*.py' \) -print0 \
         | xargs -0 sed -E -i \
             -e "s/#include <${UP}-core\\.h>/#include <${ST}-core.h>/g" \
-            -e "s/\\b${UP}_(init_with_runtime|init|shutdown|deinit|get_main_context|unref|version_string|version)\\b/${ST}_\\1/g"
-    # (b) GObject C-type namespace prefix strip (GIR types are ${ST_P}*, not ${UP_P}*)
-    #     plus the module docstring; both keep the "_frida" module name intact.
+            -e "s/\\b${UP}_(init_with_runtime|init|shutdown|deinit|get_main_context|unref|version_string|version)\\b/${ST}_\\1/g" \
+            -e "s/\\b${UP_U}_ERROR/${ST_U}_ERROR/g"
+    # (b) GObject C-type namespace prefix strip (GIR types are ${ST_P}*, not ${UP_P}*):
+    #     rewrite the prefix literal AND the skip offset (sizeof tracks the new
+    #     name length, fixing the Frida=5 vs Yszint=6 mismatch), plus the module
+    #     docstring. All three keep the "_frida" module/import name intact.
     find "$BINDGEN_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name '*.py' \) -print0 \
         | xargs -0 sed -i \
             -e "s/g_str_has_prefix (cname, \"${UP_P}\")/g_str_has_prefix (cname, \"${ST_P}\")/g" \
+            -e "s/return cname + ${#UP_P};/return cname + (sizeof (\"${ST_P}\") - 1);/g" \
             -e "s/\"_frida\", \"${UP_P}\"/\"_frida\", \"${ST_P}\"/g"
-    # (c) Internal generated identifiers: definitions and uses both live under
-    #     frida_bindgen/, so a uniform rename stays build-consistent.
+    # (c) Internal generated identifiers local to frida_bindgen/ (definitions and
+    #     uses both live here). NOTE: is_frida_list / is_frida_options are the
+    #     EXTERNAL frida_bindgen_core model API — intentionally NOT renamed, or the
+    #     generator raises AttributeError against the unrenamed dependency.
     find "$BINDGEN_DIR" -type f \( -name '*.c' -o -name '*.h' -o -name '*.py' \) -print0 \
         | xargs -0 sed -i \
             -e "s/Py${UP_P}_/Py${ST_P}_/g" \
@@ -360,8 +366,6 @@ if [[ -d "$BINDGEN_DIR" ]]; then
             -e "s/${UP}_python_/${ST}_python_/g" \
             -e "s/${UP_U}_PYTHON_/${ST_U}_PYTHON_/g" \
             -e "s/${UP_U}_IS_PYTHON_/${ST_U}_IS_PYTHON_/g" \
-            -e "s/is_${UP}_list/is_${ST}_list/g" \
-            -e "s/is_${UP}_options/is_${ST}_options/g" \
             -e "s/${UP}_current_cancellable/${ST}_current_cancellable/g" \
             -e "s/${UP}_exception_by_error_code/${ST}_exception_by_error_code/g" \
             -e "s/_${UP}_dispatch/_${ST}_dispatch/g" \
