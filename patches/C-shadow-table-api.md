@@ -7,7 +7,7 @@ Adds a JS-callable shadow API in frida-gum:
 ```js
 Interceptor.registerShadow(addr, originalBytes);   // tell KPM the original
 Interceptor.removeShadow(addr);
-Interceptor.enableShadow();                        // arm KPM mem_read hook
+Interceptor.enableShadow(superkey);                // prime KPM superkey + arm mem_read hook (throws on failure)
 const live = Interceptor.shadowEnabled();
 ```
 
@@ -35,9 +35,12 @@ GameGuard all do this scan. Patch C makes the trampolines invisible.
 
 ## Invariants
 
-- **Requires yszint-kpm v1.0+ loaded** with shadow table support. Without
-  the KPM, the supercall returns -ENOSYS and `enableShadow()` returns
-  false. Agent code must check the return.
+- **Requires yszint-kpm v1.0+ loaded** with shadow table support, and the
+  KPM superkey. `enableShadow(superkey)` takes the superkey string and
+  calls `gum_yszint_shadow_init()`. Without the KPM (or on a bad key) it
+  **throws** (`"failed to enable shadow: KPM not reachable"`); on success it
+  returns void (undefined). Agent code must wrap it in try/catch — there is
+  no boolean return to check.
 - **KP supercall number is hardcoded** (see `gum_yszint_shadow.c:42`).
   If the yszint-kpm changes its supercall number, this patch must
   follow. We've never changed it.
