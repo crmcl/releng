@@ -312,11 +312,24 @@ for setup_file in \
 done
 log "  Python setup files"
 
-# Python C extension macros
+# Python C extension macros.
+# Frida 17.16+ (bindgen rewrite) moved the PYFRIDA_* macros out of the
+# hand-written frida/_frida/extension.c into the code-generator tree under
+# frida/frida_bindgen/ (definitions in assets/codegen_macros.h; use-sites in
+# assets/codegen_*.c and codegen.py). Rewrite across whichever layout is
+# present so the rename stays build-consistent. All PYFRIDA_ refs are literal
+# token prefixes, so a uniform prefix rewrite is safe. Does NOT touch the
+# `_frida` module/import name, which is a deliberate stealth invariant.
+BINDGEN_DIR="$REPO_ROOT/subprojects/frida-python/frida/frida_bindgen"
+if [[ -d "$BINDGEN_DIR" ]]; then
+    sed_in "$BINDGEN_DIR" "*.c *.h *.py" \
+        -e "s/PY${UP_U}_/PY${ST_U}_/g"
+    log "  Python C extension macros (bindgen templates)"
+fi
 EXT_C="$REPO_ROOT/subprojects/frida-python/frida/_frida/extension.c"
 if [[ -f "$EXT_C" ]]; then
     sed -i "s/PY${UP_U}_/PY${ST_U}_/g" "$EXT_C"
-    log "  Python C extension macros"
+    log "  Python C extension macros (legacy extension.c)"
 fi
 
 # Python RPC protocol
