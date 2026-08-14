@@ -792,9 +792,7 @@ if [[ -f "$GEN_PY" ]]; then
     sed -i \
         -e "s/${UP_U}_/${ST_U}_/g" \
         -e "s/\\b${UP}_/${ST}_/g" \
-        -e "s/${UP_P}\([A-Z][a-zA-Z]*\)/${ST_P}\1/g" \
-        -e "s/${UP_P}%/${ST_P}%/g" \
-        -e "s/${UP_P}{/${ST_P}{/g" \
+        -e "s/${UP_P}/${ST_P}/g" \
         -e "s/'${UP}-/'${ST}-/g" \
         -e "s/\"${UP}-/\"${ST}-/g" \
         -e "s/f\"${UP}-/f\"${ST}-/g" \
