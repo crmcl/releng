@@ -1,130 +1,105 @@
-# yszint patches/
+# yszint 17.17 patch stack
 
-Four standalone patches that turn a stealth-renamed (post-`apply-stealth.sh`)
-yszint tree into a working Android-16-ready build.
+`apply-stealth.sh` transforms stock Frida source into the yszint namespace. Six mbox
+patches then add five yszint-specific functional changes (A through E):
 
-These exist as patches (rather than living as commits on `yszint-17.x`
-branches) because:
+| Unit | Repository | Purpose | Documentation |
+|---|---|---|---|
+| A | frida-core | Android 16 temp-file agent loader | `A-loader-temp-files.md` |
+| B | frida-core | Disable unsafe zymbiote preload on API 36+ | `B-zymbiote-api36-disable.md` |
+| C | frida-gum | KernelPatch shadow table and GumJS API | `C-shadow-table-api.md` |
+| D | frida-core | Host-side temp-file cleanup; depends on A | `D-host-side-unlink.md` |
+| E-gum | frida-gum | Export native `gum_yszint_kpm_ctl0` | `E-ctl0-service.md` |
+| E-core | frida-core | Persistent `open_service("yszint-ctl0")`; depends on E-gum | `E-ctl0-service.md` |
 
-1. **Rebases never lose them.** During the 2026-05-20 Bug #8 bisect we
-   accidentally dropped Patch C and Patch B by checking out earlier
-   commits; nobody noticed for 6 hours because `test_zymbiote_gating`
-   was reading a stale log file. Patch files in tree make this kind of
-   loss impossible: `apply-yszint-patches.sh` either applies or fails
-   loudly.
-2. **Each patch is independently reviewable** with its own `.md`
-   describing invariants, what to grep for in the build artifacts,
-   and when it can be dropped upstream.
-3. **The application order is explicit** and enforced by the runner
-   script.
-
-## Run order in a fresh rebase
+## Rebase order
 
 ```bash
-# 1. Check out the upstream version
-cd subprojects/frida-core && git checkout 17.10.x
-cd subprojects/frida-gum  && git checkout 17.10.x
-
-# 2. Apply stealth (renames frida→yszint everywhere, fixes protocol prefixes)
+# Start from matching upstream submodule pins, then:
 bash releng/apply-stealth.sh
-# (commit the result per submodule before the next step)
-
-# 3. Apply the 4 functional patches
+# Commit the stealth transform in each modified submodule.
 bash releng/apply-yszint-patches.sh
+```
 
-# 4. Build
+The runner enforces:
+
+```text
+frida-core: A -> B -> D
+frida-gum:  C -> E-gum
+frida-core: E-core
+```
+
+It applies with `git am --3way`; resolve and continue any upstream conflict before the next
+patch. Patches target the post-stealth `yszint-*` paths, so stealth must run first.
+
+## Rebuild native helper artifacts after Patch A changes
+
+Patch A changes the freestanding loader ABI. Rebuild its checked-in arm64 artifacts before
+building the server. From the repository root:
+
+```bash
+mkdir -p build/android-arm64
+ln -sf ../frida-android-arm64.txt build/android-arm64/frida-android-arm64.txt
+make -C subprojects/frida-core/src/linux/helpers build-native \
+    FRIDA_HOST=android-arm64 \
+    BUILDDIR="$PWD/build" \
+    MESON="$PWD/releng/meson/meson.py"
+./deps/toolchain-linux-x86_64/bin/ninja -C build
+```
+
+The nested crossfile symlink is required because `configure` emits
+`build/frida-android-arm64.txt`, while the helper Makefile expects
+`build/android-arm64/frida-android-arm64.txt`.
+
+## Build
+
+```bash
+export ANDROID_NDK_ROOT=/opt/android-ndk-r29
 ./configure --host=android-arm64 -- \
     -Dfrida-core:assets=embedded \
     -Dfrida-core:helper_legacy= \
     -Dfrida-core:helper_emulated_modern= \
     -Dfrida-core:helper_emulated_legacy= \
     -Dfrida-core:compat=native
-ninja -C build
+./deps/toolchain-linux-x86_64/bin/ninja -C build
 ```
 
-After Patch A, the loader artifacts need rebuilding too:
-```bash
-cd subprojects/frida-core/src/linux/helpers
-FRIDA_HOST=android-arm64 BUILDDIR=$PWD/../../../../build \
-    MESON=$PWD/../../../../../releng/meson/meson.py make
-```
-Then re-run ninja to pick up the rebuilt loader.bin.
+## Validate
 
-## Patches
-
-| Patch | Sub | Lines | Sentinel? | Standalone? | See |
-|-------|-----|-------|-----------|-------------|-----|
-| A | frida-core | ~300 | yes | no (foundation) | `A-loader-temp-files.md` |
-| B | frida-core |   31 | yes | yes | `B-zymbiote-api36-disable.md` |
-| C | frida-gum  |  485 | yes | yes | `C-shadow-table-api.md` |
-| D | frida-core |   18 | no (Bug #1 fix) | depends on A | `D-host-side-unlink.md` |
-
-"Sentinel?" — patches marked `[SENTINEL]` in their commit message
-contain the line "─── Status: NOT UPSTREAMED ──" indicating they live
-on the yszint fork forever (or until a deeper restructuring obsoletes
-them).
-
-## Dependency graph
-
-```
-        ┌───┐
-        │ A │ ← Patch A: temp_file_path field in BootstrapResult
-        └─┬─┘
-          │
-        ┌─▼─┐
-        │ D │ ← Patch D: host-side unlink of temp file (uses A's field)
-        └───┘
-
-        ┌───┐
-        │ B │ ← Patch B: zymbiote gate (standalone)
-        └───┘
-
-        ┌───┐
-        │ C │ ← Patch C: shadow API in frida-gum (standalone)
-        └───┘
-```
-
-So: A must come before D, and `apply-yszint-patches.sh` enforces this.
-B and C are independent.
-
-## Verifying after rebase
-
-After build + deploy, all four patches should pass their respective
-verification — see each `.md` for the exact `grep` / `strings` /
-test-on-device commands:
+There is no `run_all.sh`. The directory contains 10 routine tests and one opt-in
+high-rate stress test. Run the routine set with:
 
 ```bash
-# Quick all-in-one
-bash tests/on_device/run_all.sh    # 5/5 PASS expected
+for t in tests/on_device/test_*.py; do
+    case "$t" in *test_ctl0_service_high_rate.py) continue;; esac
+    echo "=== $t ==="
+    python3 "$t" || exit 1
+done
 ```
 
-The 5/5 baseline tests collectively cover all four patches:
+`test_ctl0_service_high_rate.py` is currently a known failing stress contract: its
+10,000-tap run can close/wedge the transport. Do not include it in routine validation;
+see `tests/on_device/README.md`.
 
-| Test | Patch verified |
-|------|----------------|
-| `test_dlopen_temp_file` | A (dlopen path) + D (no leak after) |
-| `test_shadow_api_surface` | C (JS API exposed) |
-| `test_shadow_register_roundtrip` | C (KPM table populated) |
-| `test_shadow_stealth_payoff` | C (mem read returns original) |
-| `test_zymbiote_gating` | B (gate fires on API 36) |
+Coverage:
 
-## Regenerating from new commits
+- A/D: `test_dlopen_temp_file.py`
+- B: `test_zymbiote_gating.py`
+- C: `test_shadow_api_surface.py`, `test_shadow_register_roundtrip.py`,
+  `test_shadow_pvr_payoff.py`, `test_shadow_stealth_payoff.py`
+- E: five `test_ctl0_service_*.py` tests
 
-If you ever need to re-author one of these patches (e.g., the upstream
-context shifted enough that the patch no longer applies):
+Prerequisites and safety constraints are in `tests/on_device/README.md`.
+
+## Re-author a patch
+
+After resolving an upstream change, commit the final submodule result and regenerate its
+mbox from that commit:
 
 ```bash
-# 1. Apply the existing patch with --reject to leave .rej files
-cd subprojects/frida-core
-git am --reject ../../releng/patches/A-loader-temp-files.patch
-
-# 2. Fix the .rej files manually
-
-# 3. Commit the result with the same Subject
-
-# 4. Regenerate the patch:
-git format-patch -1 HEAD --stdout > ../../releng/patches/A-loader-temp-files.patch
+git format-patch -1 HEAD --stdout > ../../releng/patches/<patch-name>.patch
 ```
 
-Then update the source-commit reference at the bottom of the `.md`
-so the next person can see when the patch was last hand-touched.
+Update the corresponding `.md` and this index in the same change. Current fork branches are
+published under `crmcl/frida-{core,gum,python,tools}`, `crmcl/releng`, and
+`crmcl/frida-bindgen`.

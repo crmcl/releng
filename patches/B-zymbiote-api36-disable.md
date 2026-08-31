@@ -11,8 +11,8 @@ disabled, but `device.attach()` continues to work.
 ## ⚠️ CRITICAL — sole-defender status
 
 **This patch is currently the SOLE barrier preventing zygote brick on
-Android 16.** ZygiskYszint (the intended replacement / early-injection
-backstop) is OUT OF SERVICE (per workspace owner 2026-05-18). If this
+Android 16.** The former ZygiskYszint early-injection fallback was retired and
+archived on 2026-08-30; it is not a supported replacement. If this
 patch is missing, calling `device.spawn()` on any Android 16 device
 will:
 
@@ -85,7 +85,7 @@ Source commit: `667eb01b android-16: skip zymbiote preload on API 36+ [SENTINEL]
     that works on API 36 ART, OR
 (c) We rewrite zymbiote to patch ArtMethod entry slots directly
     (LIAPP-style — viable but maintenance-heavy), OR
-(d) ZygiskYszint is repaired AND proven to install agents on every
-    Android-16 fork without zygote damage.
+(d) A new supported early-injection mechanism is implemented and proven on
+    every Android-16 fork without zygote damage.
 
 Until then: **DO NOT REMOVE.**
