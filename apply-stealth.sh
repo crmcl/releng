@@ -369,7 +369,8 @@ if [[ -d "$BINDGEN_DIR" ]]; then
             -e "s/${UP}_current_cancellable/${ST}_current_cancellable/g" \
             -e "s/${UP}_exception_by_error_code/${ST}_exception_by_error_code/g" \
             -e "s/_${UP}_dispatch/_${ST}_dispatch/g" \
-            -e "s/_${UP}_original/_${ST}_original/g"
+            -e "s/_${UP}_original/_${ST}_original/g" \
+            -e "s/, ${UP_U}, PYTHON_/, ${ST_U}, PYTHON_/g"
     log "  Python bindgen generated identifiers (core API, type prefix, internals)"
 fi
 
